@@ -1,0 +1,21 @@
+[package]
+name = "analizator"
+version = "2.0.0"
+edition = "2024"
+description = "Current & power analyzer GUI"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "x11", "wayland", "default_fonts", "persistence"] }
+egui = "0.36"
+egui_plot = "0.37"
+egui-file-dialog = "0.15"
+serde = { version = "1", features = ["derive"] }
+serialport = { version = "4.10", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "unwind"

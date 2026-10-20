@@ -4,6 +4,24 @@ Desktop app for capturing and analysing current measurements from the Analizator
 
 ![screenshot](docs/screenshot.png)
 
+## Download
+
+| File | For |
+|---|---|
+| **[analizator-linux-x86_64.tar.gz](https://github.com/PoGo430/diploma-gui2-rust/raw/main/download/analizator-linux-x86_64.tar.gz)** | Normal PCs and laptops (64-bit Intel/AMD) |
+| [analizator-linux-aarch64.tar.gz](https://github.com/PoGo430/diploma-gui2-rust/raw/main/download/analizator-linux-aarch64.tar.gz) | Raspberry Pi 4/5 with 64-bit OS |
+
+Runs on any 64-bit Linux with glibc 2.27+ (Ubuntu 18.04, Debian 10, Fedora 28 or newer); nothing else to install.
+
+```sh
+tar xzf analizator-linux-x86_64.tar.gz
+cd analizator-linux-x86_64
+./install.sh        # adds a menu entry and desktop icon (optional)
+./analizator        # or just double-click it
+```
+
+If connecting fails with "Permission denied", run `sudo usermod -aG dialout $USER` and log out and back in (`install.sh` offers to do this). No hardware? Pick **DEMO — simulated device** in the port list.
+
 ## Features
 
 - Live capture with current and power plots plus an overview strip for navigating long recordings

@@ -464,11 +464,11 @@ impl AnalyzerApp {
         let x = self.store.x[a..b].to_vec();
         let i = self.store.raw.v[a..b].to_vec();
         let f = (with_filtered && self.store.filter_active()).then(|| self.store.filt.v[a..b].to_vec());
-        let v = self.s.voltage;
+        let meta = csvio::Meta { voltage: self.s.voltage, period_ms: self.s.period_ms };
         self.busy = Some(format!("Saving {} samples…", fmt::count(b - a)));
         let tx = self.jobs_tx.clone();
         std::thread::spawn(move || {
-            let r = match csvio::save(&path, &x, &i, f.as_deref(), v) {
+            let r = match csvio::save(&path, &x, &i, f.as_deref(), &meta) {
                 Ok(n) => Job::Saved(path, n),
                 Err(e) => Job::Failed(e),
             };
@@ -540,6 +540,9 @@ impl AnalyzerApp {
             Job::Loaded(path, l) => {
                 if let Some(v) = l.voltage.filter(|v| v.is_finite() && *v >= 0.0) {
                     self.s.voltage = v;
+                }
+                if let Some(p) = l.period_ms.filter(|p| p.is_finite() && *p > 0.0) {
+                    self.s.period_ms = p;
                 }
                 let total = l.i.len();
                 self.store.load(l.x, l.i);
@@ -628,7 +631,7 @@ impl AnalyzerApp {
                 let (a, b) = self.store.index_range(self.record_start, f64::INFINITY);
                 if b > a {
                     let name = format!("power_capture_log_{}.csv", chrono::Local::now().format("%Y%m%d_%H%M%S"));
-                    let _ = csvio::save(&self.logs_dir.join(name), &self.store.x[a..b], &self.store.raw.v[a..b], None, self.s.voltage);
+                    let _ = csvio::save(&self.logs_dir.join(name), &self.store.x[a..b], &self.store.raw.v[a..b], None, &csvio::Meta { voltage: self.s.voltage, period_ms: self.s.period_ms });
                 }
                 self.mode = self.after_recording_mode();
             }

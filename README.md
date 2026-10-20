@@ -40,7 +40,27 @@ If connecting fails with "Permission denied", run `sudo usermod -aG dialout $USE
 | Board → PC | `$DB<v1>,<v2>,...,<vN>$DE\n`: current samples in µA. Any other line is shown in the device log. |
 | PC → board | `START`, `STOP`, `DUMP`, `ERASE` (newline terminated) |
 
-CSV format: `Index,Current_uA,Voltage_V,Power_uW`. Files exported while a filter is active have an extra `Current_filtered_uA` column; auto-saved recordings are always raw.
+### Capture file format
+
+Plain-text CSV. Settings that are the same for the whole capture are stored once at the top, then one current reading (µA) per line, exactly as received from the board:
+
+```
+# Analizator capture
+# voltage_V=3.3
+# sample_period_ms=1
+# start_index=0
+# saved=2026-10-20 18:37:27
+Current_uA
+0
+1750.435
+1775.779
+```
+
+- Sample *n* was taken at `(start_index + n) × sample_period_ms`; power is `current × voltage_V`.
+- Files exported while a filter is active have a second column, `Current_filtered_uA`. Auto-saved recordings are always raw.
+- If the samples are not evenly spaced (e.g. an imported file with gaps), an `Index` column is written first.
+- Older files with `Index,Current_uA,Voltage_V,Power_uW` on every line still open.
+- In Python: `pandas.read_csv(path, comment="#")`.
 
 ## Controls
 

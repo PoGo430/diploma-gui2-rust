@@ -33,6 +33,7 @@ USING IT
   Shift + drag ........... make a selection (stats for that range)
   Drag selection edges ... resize; drag inside it to move
   Overview strip ......... click/drag to jump around a long capture
+  M ...................... add a marker (right-click a plot for more)
   Filter panel ........... Average / Median / Low-pass smoothing of the plots
                            (recordings are always saved unfiltered)
   Ctrl+R record/stop · Ctrl+O open · Ctrl+S export · Ctrl+F fit · Ctrl+E selection

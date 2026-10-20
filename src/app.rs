@@ -10,7 +10,7 @@ use egui::{
     RichText, Stroke, Ui, vec2,
 };
 use egui_file_dialog::FileDialog;
-use egui_plot::{Line, Plot, PlotBounds, PlotPoints, PlotTransform, Span, VLine};
+use egui_plot::{HLine, Line, Plot, PlotBounds, PlotPoint, PlotPoints, PlotTransform, Span, Text, VLine};
 use serde::{Deserialize, Serialize};
 
 use crate::csvio;
@@ -37,6 +37,7 @@ const BTN_GREEN: Color32 = Color32::from_rgb(0x23, 0x86, 0x36);
 const BTN_RED: Color32 = Color32::from_rgb(0xb6, 0x23, 0x24);
 const BTN_AMBER: Color32 = Color32::from_rgb(0x9e, 0x6a, 0x03);
 const BTN_BLUE: Color32 = Color32::from_rgb(0x1f, 0x6f, 0xeb);
+const MARKER_C: Color32 = Color32::from_rgb(0xd2, 0xa8, 0xff);
 
 const BAUD_RATES: [u32; 7] = [115_200, 230_400, 460_800, 921_600, 1_000_000, 2_000_000, 3_000_000];
 const DUMP_IDLE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -59,6 +60,9 @@ pub struct Settings {
     filter: FilterCfg,
     show_raw: bool,
     stats_filtered: bool,
+    battery_mah: f64,
+    threshold_ma: f64,
+    show_threshold: bool,
 }
 
 impl Default for Settings {
@@ -76,6 +80,9 @@ impl Default for Settings {
             filter: FilterCfg::default(),
             show_raw: true,
             stats_filtered: false,
+            battery_mah: 220.0,
+            threshold_ma: 1.0,
+            show_threshold: true,
         }
     }
 }
@@ -86,7 +93,26 @@ enum Mode {
     Connected,
     Capture,
     Dump,
+    /// The device disappeared (e.g. USB unplugged); trying to reopen it every second.
+    Reconnecting,
 }
+
+struct Reconnect {
+    path: String,
+    desc: String,
+    baud: u32,
+    last_try: Instant,
+}
+
+#[derive(Clone)]
+struct Marker {
+    /// Sample index.
+    x: f64,
+    label: String,
+}
+
+/// (time in samples, sum of current) below and above the sleep/active threshold.
+type StateSplit = ((usize, f64), (usize, f64));
 
 #[derive(PartialEq, Clone, Copy)]
 enum Scope {
@@ -103,6 +129,7 @@ enum Grab {
     Right,
     Body(f64),
     New(f64),
+    Marker(usize),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -174,6 +201,14 @@ pub struct AnalyzerApp {
     decim_raw: Vec<(f64, f64)>,
     /// Filter settings being edited (applied when a drag ends, to avoid recomputing every frame).
     filter_edit: FilterCfg,
+    reconnect: Option<Reconnect>,
+    markers: Vec<Marker>,
+    marker_seq: usize,
+    focus_marker: Option<usize>,
+    focus_tries: u32,
+    /// Where the plot's right-click menu was opened (sample index) and the marker under it.
+    ctx_menu: Option<(f64, Option<usize>)>,
+    state_cache: Option<((u64, usize, usize, u64, bool), Instant, StateSplit)>,
 }
 
 impl AnalyzerApp {
@@ -235,6 +270,13 @@ impl AnalyzerApp {
             decim: Vec::new(),
             decim_raw: Vec::new(),
             filter_edit: FilterCfg::default(),
+            reconnect: None,
+            markers: Vec::new(),
+            marker_seq: 0,
+            focus_marker: None,
+            focus_tries: 0,
+            ctx_menu: None,
+            state_cache: None,
         };
         app.s.filter = app.s.filter.sanitized();
         app.filter_edit = app.s.filter;
@@ -279,6 +321,13 @@ impl AnalyzerApp {
 
     // ------------------------------------------------------- connection ---
     fn toggle_connection(&mut self, ctx: &egui::Context) {
+        if self.mode == Mode::Reconnecting {
+            self.reconnect = None;
+            self.mode = Mode::Offline;
+            self.log("Stopped waiting for the device.", MUTED);
+            self.status = "Disconnected".into();
+            return;
+        }
         if self.conn.is_some() {
             self.disconnect(None);
             return;
@@ -326,6 +375,61 @@ impl AnalyzerApp {
         }
     }
 
+    /// The port failed (usually: USB unplugged). Save what we have and wait for the device to return.
+    fn connection_lost(&mut self, err: String) {
+        let was_recording = self.recording();
+        match self.mode {
+            Mode::Capture => self.finish_capture(),
+            Mode::Dump => self.finish_dump(),
+            _ => {}
+        }
+        let path = self.conn.as_ref().map(|c| c.name.clone()).unwrap_or_default();
+        if let Some(c) = self.conn.take() {
+            c.close();
+        }
+        let desc = self.ports.iter().find(|p| p.path == path).map(|p| p.desc.clone()).unwrap_or_default();
+        self.log(format!("Connection to {path} lost ({err}). Waiting for the device to come back…"), AMBER);
+        if was_recording {
+            self.log("The recording up to this point was saved.", AMBER);
+        }
+        self.status = format!("Connection lost — waiting for {path} to come back (press Cancel to stop)");
+        self.reconnect = Some(Reconnect { path, desc, baud: self.s.baud, last_try: Instant::now() });
+        self.mode = Mode::Reconnecting;
+    }
+
+    fn try_reconnect(&mut self, ctx: &egui::Context) {
+        let Some(r) = self.reconnect.as_mut() else { return };
+        if r.last_try.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        r.last_try = Instant::now();
+        // same device path, or (if it came back under another name) the same USB device
+        let candidate = if Path::new(&r.path).exists() {
+            Some(r.path.clone())
+        } else if !r.desc.is_empty() {
+            serial::list_ports().into_iter().find(|p| p.desc == r.desc).map(|p| p.path)
+        } else {
+            None
+        };
+        let Some(path) = candidate else { return };
+        let baud = r.baud;
+        if let Ok(c) = Connection::open(&path, baud, self.dt(), ctx.clone()) {
+            self.conn = Some(c);
+            self.reconnect = None;
+            self.mode = Mode::Connected;
+            self.port_sel = path.clone();
+            self.log(format!("Reconnected to {path}. Press Record to continue."), GREEN);
+            self.status = format!("Reconnected to {path}");
+        }
+    }
+
+    fn log_frame_counts(&mut self) {
+        if let Some((f, c)) = self.conn.as_ref().map(|c| c.frame_counts()) {
+            let col = if c > 0 { AMBER } else { MUTED };
+            self.log(format!("{} frames received, {} corrupted", fmt::count(f as usize), fmt::count(c as usize)), col);
+        }
+    }
+
     fn send(&mut self, cmd: &str) -> bool {
         let Some(c) = self.conn.as_mut() else { return false };
         match c.send(cmd) {
@@ -353,6 +457,9 @@ impl AnalyzerApp {
         if !self.send("START") {
             return;
         }
+        if let Some(c) = &self.conn {
+            c.reset_frame_counts();
+        }
         self.mode = Mode::Capture;
         self.record_start = self.store.next_index;
         self.capture_t0 = Instant::now();
@@ -375,6 +482,7 @@ impl AnalyzerApp {
     }
 
     fn finish_capture(&mut self) {
+        self.log_frame_counts();
         self.mode = self.after_recording_mode();
         self.fit();
         let (a, b) = self.store.index_range(self.record_start, f64::INFINITY);
@@ -400,6 +508,9 @@ impl AnalyzerApp {
         if !self.send("DUMP") {
             return;
         }
+        if let Some(c) = &self.conn {
+            c.reset_frame_counts();
+        }
         self.mode = Mode::Dump;
         self.record_start = 0.0;
         self.dump_t0 = Instant::now();
@@ -409,6 +520,7 @@ impl AnalyzerApp {
     }
 
     fn finish_dump(&mut self) {
+        self.log_frame_counts();
         self.mode = self.after_recording_mode();
         self.fit();
         let n = self.store.len();
@@ -428,6 +540,8 @@ impl AnalyzerApp {
             self.record_start = 0.0;
         }
         self.store.clear();
+        self.markers.clear();
+        self.marker_seq = 0;
         self.sel_init = false;
         self.hover_x = None;
         self.view = (0.0, self.s.live_window_s / self.dt());
@@ -464,7 +578,7 @@ impl AnalyzerApp {
         let x = self.store.x[a..b].to_vec();
         let i = self.store.raw.v[a..b].to_vec();
         let f = (with_filtered && self.store.filter_active()).then(|| self.store.filt.v[a..b].to_vec());
-        let meta = csvio::Meta { voltage: self.s.voltage, period_ms: self.s.period_ms };
+        let meta = self.file_meta(a, b);
         self.busy = Some(format!("Saving {} samples…", fmt::count(b - a)));
         let tx = self.jobs_tx.clone();
         std::thread::spawn(move || {
@@ -474,6 +588,30 @@ impl AnalyzerApp {
             };
             let _ = tx.send(r);
         });
+    }
+
+    /// Settings + markers stored in the header of a file holding samples [a, b).
+    fn file_meta(&self, a: usize, b: usize) -> csvio::Meta {
+        let (x0, x1) = (self.store.x[a], self.store.x[b - 1]);
+        let markers = self.markers.iter().filter(|m| m.x >= x0 && m.x <= x1).map(|m| (m.x, m.label.clone())).collect();
+        csvio::Meta { voltage: self.s.voltage, period_ms: self.s.period_ms, markers }
+    }
+
+    /// Keep a position inside the recorded data.
+    fn clamp_x(&self, x: f64) -> f64 {
+        if self.store.is_empty() { x } else { x.clamp(self.store.first_x(), self.store.last_x()) }
+    }
+
+    fn add_marker(&mut self, x: f64) {
+        let x = self.clamp_x(x);
+        self.marker_seq += 1;
+        let m = Marker { x, label: format!("Marker {}", self.marker_seq) };
+        let k = self.markers.partition_point(|o| o.x <= x);
+        self.markers.insert(k, m);
+    }
+
+    fn sort_markers(&mut self) {
+        self.markers.sort_by(|a, b| a.x.total_cmp(&b.x));
     }
 
     fn open_dialog(&mut self, action: FileAction) {
@@ -546,6 +684,8 @@ impl AnalyzerApp {
                 }
                 let total = l.i.len();
                 self.store.load(l.x, l.i);
+                self.markers = l.markers.into_iter().map(|(x, label)| Marker { x, label }).collect();
+                self.marker_seq = self.markers.len();
                 self.sel_init = false;
                 self.fit();
                 let name = file_name(&path);
@@ -581,8 +721,11 @@ impl AnalyzerApp {
             match m {
                 Msg::Data(d) => self.on_data(d),
                 Msg::Line(t) => self.log(t, TEXT),
-                Msg::Error(e) => self.disconnect(Some(e)),
+                Msg::Error(e) => self.connection_lost(e),
             }
+        }
+        if self.mode == Mode::Reconnecting {
+            self.try_reconnect(ctx);
         }
         // background jobs
         while let Ok(j) = self.jobs_rx.try_recv() {
@@ -631,7 +774,7 @@ impl AnalyzerApp {
                 let (a, b) = self.store.index_range(self.record_start, f64::INFINITY);
                 if b > a {
                     let name = format!("power_capture_log_{}.csv", chrono::Local::now().format("%Y%m%d_%H%M%S"));
-                    let _ = csvio::save(&self.logs_dir.join(name), &self.store.x[a..b], &self.store.raw.v[a..b], None, &csvio::Meta { voltage: self.s.voltage, period_ms: self.s.period_ms });
+                    let _ = csvio::save(&self.logs_dir.join(name), &self.store.x[a..b], &self.store.raw.v[a..b], None, &self.file_meta(a, b));
                 }
                 self.mode = self.after_recording_mode();
             }
@@ -656,6 +799,15 @@ impl AnalyzerApp {
         if ctx.input_mut(|i| i.consume_shortcut(&sc(Key::F))) {
             self.fit();
         }
+        // M = add a marker (at the mouse, or "now" while recording)
+        if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::M) && i.modifiers.is_none()) && !self.store.is_empty() {
+            let x = match self.hover_x {
+                Some(h) => h,
+                None if self.recording() => self.store.last_x(),
+                None => (self.view.0 + self.view.1) / 2.0,
+            };
+            self.add_marker(x);
+        }
         if ctx.input_mut(|i| i.consume_shortcut(&sc(Key::E))) {
             let next = if self.scope == Scope::Selection { Scope::All } else { Scope::Selection };
             self.set_scope(next);
@@ -675,6 +827,7 @@ impl AnalyzerApp {
     fn top_bar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let connected = self.conn.is_some();
+        let linked = connected || self.mode == Mode::Reconnecting;
         let rec = self.recording();
         let busy = self.busy.is_some();
         ui.horizontal_centered(|ui| {
@@ -687,7 +840,7 @@ impl AnalyzerApp {
                     if self.port_sel.is_empty() { "No port".into() } else { self.port_sel.clone() }
                 })
             };
-            ui.add_enabled_ui(!connected, |ui| {
+            ui.add_enabled_ui(!linked, |ui| {
                 egui::ComboBox::from_id_salt("port")
                     .width(250.0)
                     .selected_text(label)
@@ -722,7 +875,13 @@ impl AnalyzerApp {
                     .response
                     .on_hover_text("Baud rate");
             });
-            let (t, c) = if connected { ("Disconnect", BTN_RED) } else { ("Connect", BTN_GREEN) };
+            let (t, c) = if self.mode == Mode::Reconnecting {
+                ("Cancel", BTN_RED)
+            } else if connected {
+                ("Disconnect", BTN_RED)
+            } else {
+                ("Connect", BTN_GREEN)
+            };
             if button(ui, true, t, Some(c), "", 104.0) {
                 self.toggle_connection(&ctx);
             }
@@ -763,6 +922,7 @@ impl AnalyzerApp {
                         Mode::Dump => ("DUMPING".to_string(), AMBER),
                         Mode::Connected => (format!("CONNECTED · {}", self.conn.as_ref().map(|c| c.name.as_str()).unwrap_or("")), GREEN),
                         Mode::Offline => ("OFFLINE".to_string(), MUTED),
+                        Mode::Reconnecting => ("RECONNECTING…".to_string(), AMBER),
                     }
                 };
                 Frame::new()
@@ -787,8 +947,16 @@ impl AnalyzerApp {
             let msg = self.busy.as_deref().unwrap_or(&self.status);
             ui.label(RichText::new(msg).color(MUTED));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(format!("{:.0} MB", self.store.bytes() as f64 / 1e6)).color(MUTED));
+                ui.label(RichText::new(fmt::si_digits(self.store.bytes() as f64, "B", 3)).color(MUTED))
+                    .on_hover_text("Memory used by the samples");
                 ui.add_space(12.0);
+                if let Some((f, c)) = self.conn.as_ref().map(|c| c.frame_counts()) {
+                    let col = if c > 0 { RED } else { MUTED };
+                    ui.label(RichText::new(format!("{} corrupted", fmt::count(c as usize))).color(col))
+                        .on_hover_text("Data frames that arrived damaged (missing start/end marker or a bad value) since the recording started");
+                    ui.label(RichText::new(format!("{} frames ·", fmt::count(f as usize))).color(MUTED));
+                    ui.add_space(12.0);
+                }
                 if self.recording() {
                     ui.label(RichText::new(fmt::si_digits(self.rate, "S/s", 3)).color(MUTED));
                     ui.add_space(12.0);
@@ -801,7 +969,7 @@ impl AnalyzerApp {
     fn sidebar(&mut self, ui: &mut Ui) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(8.0);
-            group(ui, "MEASUREMENT", |ui| {
+            section(ui, "MEASUREMENT", |ui| {
                 egui::Grid::new("settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                     ui.label(RichText::new("DUT voltage").color(MUTED));
                     ui.add(egui::DragValue::new(&mut self.s.voltage).range(0.0..=30.0).speed(0.01).fixed_decimals(3).suffix(" V"));
@@ -838,10 +1006,10 @@ impl AnalyzerApp {
             });
 
             ui.add_space(8.0);
-            group(ui, "FILTER", |ui| self.filter_ui(ui));
+            section(ui, "FILTER", |ui| self.filter_ui(ui));
 
             ui.add_space(8.0);
-            group(ui, "STATISTICS", |ui| {
+            section(ui, "STATISTICS", |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Range").color(MUTED));
                     let mut scope = self.scope;
@@ -874,9 +1042,14 @@ impl AnalyzerApp {
             });
 
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("DEVICE LOG").size(11.0).strong().color(MUTED));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            section(ui, "BATTERY & SLEEP", |ui| self.analysis_ui(ui));
+
+            ui.add_space(8.0);
+            section(ui, "MARKERS", |ui| self.markers_ui(ui));
+
+            ui.add_space(8.0);
+            section(ui, "DEVICE LOG", |ui| {
+                ui.horizontal(|ui| {
                     if ui.small_button("Open logs folder").on_hover_text(self.logs_dir.display().to_string()).clicked() {
                         let _ = std::fs::create_dir_all(&self.logs_dir);
                         let _ = std::process::Command::new("xdg-open").arg(&self.logs_dir).spawn();
@@ -885,11 +1058,9 @@ impl AnalyzerApp {
                         self.log.clear();
                     }
                 });
-            });
-            group(ui, "", |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("log")
-                    .max_height((ui.available_height() - 24.0).max(120.0))
+                    .max_height((ui.available_height() - 24.0).max(160.0))
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -983,22 +1154,174 @@ impl AnalyzerApp {
         }
     }
 
-    fn stats_tiles(&self, ui: &mut Ui) {
+    /// Sample range [a, b) the statistics are about (whole capture, selection or visible window).
+    fn scope_range(&self) -> Option<(usize, usize)> {
         let n = self.store.len();
-        let series = self.store.series(self.s.stats_filtered);
-        let g = match self.scope {
-            _ if n == 0 => None,
-            Scope::All => Some(series.total),
-            Scope::Selection => {
-                let (a, b) = self.store.index_range(self.sel.0, self.sel.1);
-                Some(series.agg(a, b))
-            }
-            Scope::Visible => {
-                let (a, b) = self.store.index_range(self.view.0, self.view.1);
-                Some(series.agg(a, b))
-            }
+        let (a, b) = match self.scope {
+            _ if n == 0 => return None,
+            Scope::All => (0, n),
+            Scope::Selection => self.store.index_range(self.sel.0, self.sel.1),
+            Scope::Visible => self.store.index_range(self.view.0, self.view.1),
         };
-        let g = g.filter(|g| g.count > 0);
+        (b > a).then_some((a, b))
+    }
+
+    fn scope_agg(&self) -> Option<crate::data::Agg> {
+        let (a, b) = self.scope_range()?;
+        Some(self.store.series(self.s.stats_filtered).agg(a, b)).filter(|g| g.count > 0)
+    }
+
+    /// Time and charge below/above the sleep threshold (cached; it needs a full scan).
+    fn state_split(&mut self) -> Option<StateSplit> {
+        let (a, b) = self.scope_range()?;
+        let thr = self.s.threshold_ma * 1000.0;
+        let key = (self.store.generation, a, b, thr.to_bits(), self.s.stats_filtered && self.store.filter_active());
+        if let Some((k, t, r)) = &self.state_cache {
+            // while recording, refresh at most ~4 times a second
+            if *k == key || (self.recording() && k.3 == key.3 && k.4 == key.4 && t.elapsed() < Duration::from_millis(250)) {
+                return Some(*r);
+            }
+        }
+        let r = self.store.series(self.s.stats_filtered).split(a, b, thr);
+        self.state_cache = Some((key, Instant::now(), r));
+        Some(r)
+    }
+
+    fn analysis_ui(&mut self, ui: &mut Ui) {
+        let scope_name = match self.scope {
+            Scope::All => "whole capture",
+            Scope::Selection => "selection",
+            Scope::Visible => "visible window",
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Sleep below").color(MUTED));
+            ui.add(egui::DragValue::new(&mut self.s.threshold_ma).range(0.0001..=10_000.0).speed(0.01).max_decimals(4).suffix(" mA"))
+                .on_hover_text("Current threshold: below = sleep, at or above = active");
+            ui.checkbox(&mut self.s.show_threshold, "show").on_hover_text("Draw the threshold on the current plot");
+        });
+        let split = self.state_split();
+        let dt = self.dt();
+        if let Some(((nl, sl), (nh, sh))) = split {
+            let total_n = (nl + nh).max(1) as f64;
+            let total_q = sl + sh;
+            let pct = |v: f64, t: f64| if t > 0.0 { format!("{:.1} %", v / t * 100.0) } else { "—".into() };
+            let avg = |s: f64, n: usize| if n > 0 { fmt::si(s / n as f64 * 1e-6, "A") } else { "—".into() };
+            egui::Grid::new("states").num_columns(4).spacing([14.0, 4.0]).show(ui, |ui| {
+                ui.label("");
+                for h in ["time", "avg current", "charge"] {
+                    ui.label(RichText::new(h).size(11.0).color(MUTED));
+                }
+                ui.end_row();
+                for (name, col, n, sum) in [("Sleep", ACCENT, nl, sl), ("Active", AMBER, nh, sh)] {
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 4.0, col);
+                        ui.label(RichText::new(name).color(col));
+                    });
+                    ui.label(pct(n as f64, total_n)).on_hover_text(fmt::duration(n as f64 * dt));
+                    ui.label(avg(sum, n));
+                    ui.label(pct(sum, total_q)).on_hover_text(fmt::si(sum * 1e-6 * dt / 3600.0, "Ah"));
+                    ui.end_row();
+                }
+            });
+        } else {
+            ui.label(RichText::new("No data").color(MUTED));
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Battery").color(MUTED));
+            ui.add(egui::DragValue::new(&mut self.s.battery_mah).range(0.1..=1_000_000.0).speed(1.0).max_decimals(1).suffix(" mAh"))
+                .on_hover_text("Battery capacity, e.g. CR2032 ≈ 220 mAh, AA ≈ 2500 mAh");
+            let life = self.scope_agg().map(|g| g.sum / g.count as f64).filter(|avg| *avg > 0.0).map(|avg_ua| {
+                let hours = self.s.battery_mah * 1000.0 / avg_ua;
+                fmt_runtime(hours)
+            });
+            ui.label(RichText::new(format!("lasts ≈ {}", life.unwrap_or_else(|| "—".into()))).strong().color(GREEN));
+        });
+        ui.label(
+            RichText::new(format!("Based on the average current of the {scope_name}; ignores self-discharge and temperature."))
+                .size(11.0)
+                .color(MUTED),
+        );
+    }
+
+    fn markers_ui(&mut self, ui: &mut Ui) {
+        if self.markers.is_empty() {
+            ui.label(
+                RichText::new("Press M while pointing at a plot, or right-click a plot and choose Add marker. While recording, M marks the current moment. Drag a marker line to move it.")
+                    .size(12.0)
+                    .color(MUTED),
+            );
+            return;
+        }
+        let scale_time = self.s.x_time;
+        let dt = self.dt();
+        let mut go = None;
+        let mut select = None;
+        let mut delete = None;
+        let n = self.markers.len();
+        egui::Grid::new("markers").num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
+            for k in 0..n {
+                let r = ui.add_sized([130.0, 24.0], egui::TextEdit::singleline(&mut self.markers[k].label).text_color(MARKER_C))
+                    .on_hover_text("Click to rename");
+                // focus the name of a marker just added from the menu (the closing menu can
+                // take focus away again in the first frames, so keep asking for a few frames)
+                if self.focus_marker == Some(k) {
+                    self.focus_tries += 1;
+                    if r.has_focus() || self.focus_tries > 20 {
+                        self.focus_marker = None;
+                    } else {
+                        r.request_focus();
+                        // select the default name so typing replaces it
+                        let n = self.markers[k].label.chars().count();
+                        if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), r.id) {
+                            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(0),
+                                egui::text::CCursor::new(n),
+                            )));
+                            st.store(ui.ctx(), r.id);
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                }
+                let x = self.markers[k].x;
+                let t = if scale_time { fmt::si(x * dt, "s") } else { format!("#{}", x as i64) };
+                if ui.add(egui::Button::new(RichText::new(t).monospace().size(12.0)).frame(false)).on_hover_text("Show in plot").clicked() {
+                    go = Some(k);
+                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    if k + 1 < n && ui.small_button("➡").on_hover_text("Select from this marker to the next one").clicked() {
+                        select = Some(k);
+                    }
+                    if ui.small_button("🗙").on_hover_text("Delete marker").clicked() {
+                        delete = Some(k);
+                    }
+                });
+                ui.end_row();
+            }
+        });
+        if let Some(k) = go {
+            let x = self.markers[k].x;
+            let half = (self.view.1 - self.view.0) / 2.0;
+            self.view = (x - half, x + half);
+            self.s.follow = false;
+        }
+        if let Some(k) = select {
+            self.sel = (self.markers[k].x, self.markers[k + 1].x);
+            self.sel_init = true;
+            self.scope = Scope::Selection;
+        }
+        if let Some(k) = delete {
+            self.markers.remove(k);
+        }
+        if ui.small_button("Delete all").clicked() {
+            self.markers.clear();
+        }
+    }
+
+    fn stats_tiles(&self, ui: &mut Ui) {
+        let g = self.scope_agg();
         let (dt, v) = (self.dt(), self.s.voltage);
         let dash = || "—".to_string();
         let vals: [(&str, String, Color32); 10] = match g {
@@ -1151,6 +1474,9 @@ impl AnalyzerApp {
             eprintln!("press id={id} at={press_pos:?} shift={shift}");
         }
         if !down && self.grab != Grab::None {
+            if matches!(self.grab, Grab::Marker(_)) {
+                self.sort_markers();
+            }
             self.grab = Grab::None;
         }
         let mut near_edge = false;
@@ -1161,10 +1487,16 @@ impl AnalyzerApp {
             if tf.frame().contains(pos) && self.scope == Scope::Selection {
                 near_edge = (pos.x - lx).abs() < 7.0 || (pos.x - rx).abs() < 7.0;
             }
+            let marker_at = |px: f32| self.markers.iter().position(|m| (tf.position_from_point_x(m.x * scale) - px).abs() < 6.0);
+            if tf.frame().contains(pos) && marker_at(pos.x).is_some() {
+                near_edge = true;
+            }
             if let Some(pp) = press_pos.filter(|p| tf.frame().contains(*p) && self.grab == Grab::None) {
                 let xp = tf.value_from_position(pp).x / scale;
                 let sel_on = self.scope == Scope::Selection;
-                self.grab = if sel_on && (pp.x - lx).abs() < 7.0 {
+                self.grab = if let Some(k) = marker_at(pp.x) {
+                    Grab::Marker(k)
+                } else if sel_on && (pp.x - lx).abs() < 7.0 {
                     Grab::Left
                 } else if sel_on && (pp.x - rx).abs() < 7.0 {
                     Grab::Right
@@ -1187,9 +1519,17 @@ impl AnalyzerApp {
                         self.sel = (xv - off, xv - off + w);
                     }
                     Grab::New(anchor) => self.sel = (anchor.min(xv), anchor.max(xv).max(anchor.min(xv) + 1.0)),
+                    Grab::Marker(k) => {
+                        let x = self.clamp_x(xv.round());
+                        if let Some(m) = self.markers.get_mut(k) {
+                            m.x = x;
+                        }
+                    }
                     Grab::None => {}
                 }
-                self.sel_init = true;
+                if !matches!(self.grab, Grab::Marker(_)) {
+                    self.sel_init = true;
+                }
             }
         }
 
@@ -1200,6 +1540,9 @@ impl AnalyzerApp {
         let hover = self.hover_x.and_then(|x| self.store.nearest(x)).map(|k| self.store.x[k] * scale);
         let x_time = self.s.x_time;
         let dragging_sel = self.grab != Grab::None;
+        let marks: Vec<(f64, String)> = self.markers.iter().map(|m| (m.x * scale, m.label.clone())).collect();
+        let label_y = yr.1 * factor;
+        let threshold = (id == 0 && self.s.show_threshold && !self.store.is_empty()).then(|| self.s.threshold_ma * 1e-3);
 
         let resp = Plot::new(("main", id))
             .height(height.max(60.0))
@@ -1213,7 +1556,7 @@ impl AnalyzerApp {
             .allow_drag([!dragging_sel, false])
             .y_axis_min_width(72.0)
             .grid_color(GRID)
-            .x_axis_formatter(move |m, _| x_label(m.value, x_time))
+            .x_axis_formatter(move |m, r| x_label_edge(m.value, r, x_time))
             .y_axis_formatter(move |m, _| fmt::si_digits(m.value, unit, 3))
             .show(ui, move |pu| {
                 pu.set_plot_bounds(bounds);
@@ -1224,6 +1567,16 @@ impl AnalyzerApp {
                     pu.line(Line::new("", PlotPoints::new(rp)).color(color.gamma_multiply(0.28)).width(1.0));
                 }
                 pu.line(Line::new("", PlotPoints::new(pts)).color(color).width(1.0).fill(0.0).fill_alpha(0.10));
+                if let Some(t) = threshold {
+                    pu.hline(HLine::new("", t).color(AMBER.gamma_multiply(0.7)).width(1.0).style(egui_plot::LineStyle::dashed_dense()));
+                }
+                for (mx, label) in marks {
+                    pu.vline(VLine::new("", mx).color(MARKER_C).width(1.5));
+                    if id == 0 {
+                        let text = RichText::new(format!(" {label}")).size(11.5).color(MARKER_C);
+                        pu.text(Text::new("", PlotPoint::new(mx, label_y), text).anchor(Align2::LEFT_TOP));
+                    }
+                }
                 if let Some(hx) = hover {
                     pu.vline(VLine::new("", hx).color(MUTED).width(1.0).style(egui_plot::LineStyle::dashed_loose()));
                 }
@@ -1270,6 +1623,57 @@ impl AnalyzerApp {
         if r.double_clicked() {
             self.fit();
         }
+        // right-click menu
+        if r.secondary_clicked() {
+            if let Some(p) = r.interact_pointer_pos() {
+                let near = self.markers.iter().position(|m| (tf.position_from_point_x(m.x * scale) - p.x).abs() < 6.0);
+                self.ctx_menu = Some((tf.value_from_position(p).x / scale, near));
+            }
+        }
+        if let Some((cx, near)) = self.ctx_menu {
+            let mut action = 0;
+            let has_markers = !self.markers.is_empty();
+            let near_label = near.and_then(|k| self.markers.get(k)).map(|m| m.label.clone());
+            r.context_menu(|ui| {
+                if ui.button("Add marker here").clicked() {
+                    action = 1;
+                }
+                if let Some(l) = &near_label {
+                    if ui.button(format!("Delete marker “{l}”")).clicked() {
+                        action = 2;
+                    }
+                }
+                if has_markers && ui.button("Delete all markers").clicked() {
+                    action = 3;
+                }
+                ui.separator();
+                if ui.button("Fit all data").clicked() {
+                    action = 4;
+                }
+                if action != 0 {
+                    ui.close();
+                }
+            });
+            match action {
+                1 if !self.store.is_empty() => {
+                    self.add_marker(cx.round());
+                    // added on purpose from the menu: let the user type a name right away
+                    self.focus_marker = self.markers.iter().position(|m| m.x == self.clamp_x(cx.round()));
+                    self.focus_tries = 0;
+                }
+                2 => {
+                    if let Some(k) = near.filter(|k| *k < self.markers.len()) {
+                        self.markers.remove(k);
+                    }
+                }
+                3 => self.markers.clear(),
+                4 => self.fit(),
+                _ => {}
+            }
+            if action != 0 {
+                self.ctx_menu = None;
+            }
+        }
         if near_edge || matches!(self.grab, Grab::Left | Grab::Right) {
             ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
         } else if matches!(self.grab, Grab::Body(_)) {
@@ -1298,6 +1702,7 @@ impl AnalyzerApp {
         let view = (self.view.0 * scale, self.view.1 * scale);
         let hover = self.hover_x.and_then(|x| self.store.nearest(x)).map(|k| self.store.x[k] * scale);
         let x_time = self.s.x_time;
+        let marks: Vec<f64> = self.markers.iter().map(|m| m.x * scale).collect();
         let resp = Plot::new("overview")
             .height(height)
             .show_x(false)
@@ -1311,12 +1716,15 @@ impl AnalyzerApp {
             .show_grid([true, false])
             .grid_color(GRID)
             .y_axis_min_width(72.0)
-            .x_axis_formatter(move |m, _| x_label(m.value, x_time))
+            .x_axis_formatter(move |m, r| x_label_edge(m.value, r, x_time))
             .y_axis_formatter(|_, _| String::new())
             .show(ui, move |pu| {
                 pu.set_plot_bounds(bounds);
                 pu.line(Line::new("", PlotPoints::new(pts)).color(CURRENT_C.gamma_multiply(0.75)).width(1.0));
                 pu.span(Span::new("", view.0..=view.1).fill(ACCENT.gamma_multiply(0.18)).border(Stroke::new(1.0, ACCENT)));
+                for mx in marks {
+                    pu.vline(VLine::new("", mx).color(MARKER_C.gamma_multiply(0.8)).width(1.0));
+                }
                 if let Some(hx) = hover {
                     pu.vline(VLine::new("", hx).color(MUTED).width(1.0));
                 }
@@ -1471,6 +1879,14 @@ fn vsep(ui: &mut Ui) {
     ui.add_space(4.0);
 }
 
+/// Collapsible sidebar section (open/closed state is remembered).
+fn section(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+    egui::CollapsingHeader::new(RichText::new(title).size(11.0).strong().color(MUTED))
+        .id_salt(title)
+        .default_open(true)
+        .show_unindented(ui, |ui| group(ui, "", add));
+}
+
 fn group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
     if !title.is_empty() {
         ui.label(RichText::new(title).size(11.0).strong().color(MUTED));
@@ -1514,6 +1930,31 @@ fn plot_header(ui: &mut Ui, title: &str, color: Color32, filter: &str) {
             ui.label(RichText::new(format!("filtered: {filter}")).size(11.5).color(ACCENT));
         }
     });
+}
+
+/// Like `x_label`, but leaves out the label at the very right edge (it would be cut off).
+fn x_label_edge(v: f64, range: &std::ops::RangeInclusive<f64>, time: bool) -> String {
+    let span = range.end() - range.start();
+    if v > range.end() - span * 0.025 {
+        return String::new();
+    }
+    x_label(v, time)
+}
+
+/// Battery runtime: "45 min", "17.5 h", "41 days", "2.3 years".
+fn fmt_runtime(hours: f64) -> String {
+    if !hours.is_finite() {
+        return "—".into();
+    }
+    if hours < 1.0 {
+        format!("{:.0} min", hours * 60.0)
+    } else if hours < 48.0 {
+        format!("{} h", fmt::sig(hours, 3))
+    } else if hours < 24.0 * 730.0 {
+        format!("{} days", fmt::sig(hours / 24.0, 3))
+    } else {
+        format!("{} years", fmt::sig(hours / 24.0 / 365.25, 3))
+    }
 }
 
 fn x_label(v: f64, time: bool) -> String {

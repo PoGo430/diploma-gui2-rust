@@ -8,6 +8,7 @@
 //! # sample_period_ms=1
 //! # start_index=0
 //! # saved=2026-10-20 18:37:27
+//! # marker=1500,radio TX
 //! Current_uA
 //! 0
 //! 1750.435
@@ -28,6 +29,8 @@ use std::path::Path;
 pub struct Meta {
     pub voltage: f64,
     pub period_ms: f64,
+    /// (sample index, label)
+    pub markers: Vec<(f64, String)>,
 }
 
 /// `filtered`: optional extra column with the filtered current (export only).
@@ -43,15 +46,22 @@ pub fn save(path: &Path, x: &[f64], i: &[f64], filtered: Option<&[f64]>, meta: &
 
     let start = x.first().copied().unwrap_or(0.0);
     let contiguous = x.iter().enumerate().all(|(k, &v)| v == start + k as f64);
-    let header = format!(
-        "# Analizator capture\n# voltage_V={}\n# sample_period_ms={}\n# start_index={}\n# saved={}\n{}Current_uA{}\n",
+    let mut header = format!(
+        "# Analizator capture\n# voltage_V={}\n# sample_period_ms={}\n# start_index={}\n# saved={}\n",
         meta.voltage,
         meta.period_ms,
         start as i64,
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+    );
+    for (mx, label) in &meta.markers {
+        let label: String = label.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        header.push_str(&format!("# marker={},{}\n", mx.round() as i64, label.trim()));
+    }
+    header.push_str(&format!(
+        "{}Current_uA{}\n",
         if contiguous { "" } else { "Index," },
         if filtered.is_some() { ",Current_filtered_uA" } else { "" },
-    );
+    ));
     w.write_all(header.as_bytes()).map_err(werr)?;
 
     let mut line = Vec::with_capacity(64 * 1024);
@@ -139,6 +149,7 @@ pub struct Loaded {
     pub i: Vec<f64>,
     pub voltage: Option<f64>,
     pub period_ms: Option<f64>,
+    pub markers: Vec<(f64, String)>,
 }
 
 pub fn load(path: &Path) -> Result<Loaded, String> {
@@ -146,6 +157,7 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     let text = String::from_utf8_lossy(&bytes);
     let mut voltage = None;
     let mut period_ms = None;
+    let mut markers = Vec::new();
     let mut start_index = 0.0;
     // column positions; None until a header (or the first data line) tells us
     let mut col_x: Option<usize> = None;
@@ -162,12 +174,18 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
             continue;
         }
         if let Some(c) = line.strip_prefix('#') {
-            if let Some((k, v)) = c.split_once('=') {
-                let v = v.trim().parse::<f64>().ok();
+            if let Some((k, raw)) = c.split_once('=') {
+                let v = raw.trim().parse::<f64>().ok();
                 match k.trim() {
                     "voltage_V" => voltage = v,
                     "sample_period_ms" => period_ms = v,
                     "start_index" => start_index = v.unwrap_or(0.0),
+                    "marker" => {
+                        let (pos, label) = raw.split_once(',').unwrap_or((raw, ""));
+                        if let Ok(p) = pos.trim().parse::<f64>() {
+                            markers.push((p, label.trim().to_string()));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -237,7 +255,8 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
         x = idx.iter().map(|&k| x[k]).collect();
         i = idx.iter().map(|&k| i[k]).collect();
     }
-    Ok(Loaded { x, i, voltage, period_ms })
+    markers.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(Loaded { x, i, voltage, period_ms, markers })
 }
 
 #[cfg(test)]
@@ -250,13 +269,15 @@ mod tests {
         dir.join(name)
     }
 
-    const META: Meta = Meta { voltage: 3.3, period_ms: 0.5 };
+    fn meta() -> Meta {
+        Meta { voltage: 3.3, period_ms: 0.5, markers: vec![(12.0, "radio TX".into()), (11.0, "line\nbreak".into())] }
+    }
 
     #[test]
     fn roundtrip_new_format() {
         let p = tmp("new.csv");
         let i = [0.0, 1750.435, 2.25, -0.0001, 123456.789012];
-        save(&p, &[10.0, 11.0, 12.0, 13.0, 14.0], &i, None, &META).unwrap();
+        save(&p, &[10.0, 11.0, 12.0, 13.0, 14.0], &i, None, &meta()).unwrap();
         let text = fs::read_to_string(&p).unwrap();
         assert!(text.contains("# voltage_V=3.3\n") && text.contains("\nCurrent_uA\n0\n1750.435\n"), "{text}");
         let l = load(&p).unwrap();
@@ -264,12 +285,13 @@ mod tests {
         assert_eq!(l.x, vec![10.0, 11.0, 12.0, 13.0, 14.0]);
         assert_eq!(l.voltage, Some(3.3));
         assert_eq!(l.period_ms, Some(0.5));
+        assert_eq!(l.markers, vec![(11.0, "line break".to_string()), (12.0, "radio TX".to_string())]);
     }
 
     #[test]
     fn filtered_column_and_gaps() {
         let p = tmp("filt.csv");
-        save(&p, &[0.0, 1.0, 5.0], &[1.5, 2.0, 3.0], Some(&[1.23456, 2.0, 0.1]), &META).unwrap();
+        save(&p, &[0.0, 1.0, 5.0], &[1.5, 2.0, 3.0], Some(&[1.23456, 2.0, 0.1]), &meta()).unwrap();
         let text = fs::read_to_string(&p).unwrap();
         assert!(text.contains("\nIndex,Current_uA,Current_filtered_uA\n0,1.5,1.2346\n1,2,2\n5,3,0.1\n"), "{text}");
         let l = load(&p).unwrap();
@@ -316,7 +338,7 @@ mod bench {
         eprintln!("loaded {} rows in {:.2} s", l.i.len(), t.elapsed().as_secs_f64());
         let t = std::time::Instant::now();
         let out = std::env::temp_dir().join("big_out.csv");
-        super::save(&out, &l.x, &l.i, None, &super::Meta { voltage: 3.3, period_ms: 1.0 }).unwrap();
+        super::save(&out, &l.x, &l.i, None, &super::Meta { voltage: 3.3, period_ms: 1.0, markers: vec![] }).unwrap();
         eprintln!("saved in {:.2} s, {} MB", t.elapsed().as_secs_f64(), std::fs::metadata(&out).unwrap().len() / 1_000_000);
         let t = std::time::Instant::now();
         let l2 = super::load(&out).unwrap();

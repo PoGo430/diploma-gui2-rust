@@ -5,7 +5,7 @@
 //! PC -> board:  START / STOP / DUMP / ERASE  (newline terminated)
 
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -25,6 +25,8 @@ pub enum Msg {
 pub struct PortInfo {
     pub path: String,
     pub label: String,
+    /// USB product name etc. (used to find the device again after it was re-plugged)
+    pub desc: String,
 }
 
 /// List serial ports. On Linux this reads /sys directly (no libudev needed).
@@ -52,7 +54,16 @@ pub fn list_ports() -> Vec<PortInfo> {
                 let desc = usb_description(&dev).unwrap_or_else(|| driver.clone());
                 let path = format!("/dev/{name}");
                 let label = if desc.is_empty() { path.clone() } else { format!("{path}  —  {desc}") };
-                out.push(PortInfo { path, label });
+                out.push(PortInfo { path, label, desc });
+            }
+        }
+    }
+    // extra device paths, e.g. a virtual port made with socat (for testing)
+    if let Some(extra) = std::env::var_os("ANALIZATOR_EXTRA_PORTS") {
+        for p in std::env::split_paths(&extra) {
+            let path = p.to_string_lossy().to_string();
+            if p.exists() && !out.iter().any(|o| o.path == path) {
+                out.push(PortInfo { label: path.clone(), path, desc: String::new() });
             }
         }
     }
@@ -60,7 +71,7 @@ pub fn list_ports() -> Vec<PortInfo> {
     {
         if let Ok(ports) = serialport::available_ports() {
             for p in ports {
-                out.push(PortInfo { label: p.port_name.clone(), path: p.port_name });
+                out.push(PortInfo { label: p.port_name.clone(), path: p.port_name, desc: String::new() });
             }
         }
     }
@@ -97,8 +108,16 @@ impl CmdWriter for Box<dyn serialport::SerialPort> {
     }
 }
 
+/// Frame counters, shared with the reader thread.
+#[derive(Default)]
+pub struct LinkStats {
+    pub frames: AtomicU64,
+    pub corrupted: AtomicU64,
+}
+
 pub struct Connection {
     pub name: String,
+    pub stats: Arc<LinkStats>,
     pub rx: Receiver<Msg>,
     writer: Box<dyn CmdWriter>,
     stop: Arc<AtomicBool>,
@@ -110,12 +129,14 @@ impl Connection {
     pub fn open(path: &str, baud: u32, period_s: f64, ctx: egui::Context) -> Result<Self, String> {
         let (tx, rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(LinkStats::default());
         if path == DEMO_PORT {
             let demo = Arc::new(Mutex::new(Demo::new(period_s)));
             let reader = DemoReader(demo.clone());
-            let thread = spawn_reader(reader, tx, stop.clone(), ctx);
+            let thread = spawn_reader(reader, tx, stop.clone(), stats.clone(), ctx);
             return Ok(Self {
                 name: "DEMO".into(),
+                stats,
                 rx,
                 writer: Box::new(DemoWriter(demo.clone())),
                 stop,
@@ -139,12 +160,22 @@ impl Connection {
             })?;
         let _ = port.clear(serialport::ClearBuffer::Input);
         let writer = port.try_clone().map_err(|e| format!("Could not open {path}: {e}"))?;
-        let thread = spawn_reader(port, tx, stop.clone(), ctx);
-        Ok(Self { name: path.to_string(), rx, writer: Box::new(writer), stop, thread: Some(thread), demo: None })
+        let thread = spawn_reader(port, tx, stop.clone(), stats.clone(), ctx);
+        Ok(Self { name: path.to_string(), stats, rx, writer: Box::new(writer), stop, thread: Some(thread), demo: None })
     }
 
     pub fn send(&mut self, cmd: &str) -> Result<(), String> {
         self.writer.send(cmd).map_err(|e| e.to_string())
+    }
+
+    /// (frames received, damaged frames) since connecting or the last reset.
+    pub fn frame_counts(&self) -> (u64, u64) {
+        (self.stats.frames.load(Ordering::Relaxed), self.stats.corrupted.load(Ordering::Relaxed))
+    }
+
+    pub fn reset_frame_counts(&self) {
+        self.stats.frames.store(0, Ordering::Relaxed);
+        self.stats.corrupted.store(0, Ordering::Relaxed);
     }
 
     pub fn set_demo_period(&self, period_s: f64) {
@@ -171,6 +202,7 @@ fn spawn_reader<R: Read + Send + 'static>(
     mut port: R,
     tx: Sender<Msg>,
     stop: Arc<AtomicBool>,
+    stats: Arc<LinkStats>,
     ctx: egui::Context,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
@@ -180,6 +212,8 @@ fn spawn_reader<R: Read + Send + 'static>(
             let mut acc: Vec<u8> = Vec::with_capacity(256 * 1024);
             let mut pending: Vec<f64> = Vec::with_capacity(65536);
             let mut last_emit = Instant::now();
+                    // the first line may have been cut in half when we connected: don't count it as damaged
+            let mut first_line = true;
             while !stop.load(Ordering::Relaxed) {
                 match port.read(&mut buf) {
                     Ok(0) => {}
@@ -187,10 +221,20 @@ fn spawn_reader<R: Read + Send + 'static>(
                         acc.extend_from_slice(&buf[..n]);
                         if let Some(nl) = acc.iter().rposition(|&b| b == b'\n') {
                             for line in acc[..nl].split(|&b| b == b'\n') {
-                                if let Some(text) = parse_line(line, &mut pending) {
-                                    let _ = tx.send(Msg::Line(text));
-                                    ctx.request_repaint();
+                                match parse_line(line, &mut pending) {
+                                    Parsed::Empty => continue,
+                                    Parsed::Text(text) => {
+                                        let _ = tx.send(Msg::Line(text));
+                                        ctx.request_repaint();
+                                    }
+                                    Parsed::Frame { ok } => {
+                                        stats.frames.fetch_add(1, Ordering::Relaxed);
+                                        if !ok && !first_line {
+                                            stats.corrupted.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
                                 }
+                                first_line = false;
                             }
                             acc.drain(..=nl);
                         } else if acc.len() > 1_000_000 {
@@ -220,27 +264,44 @@ fn spawn_reader<R: Read + Send + 'static>(
         .expect("spawn reader thread")
 }
 
-/// Parses one line. Samples go into `out`; returns Some(text) for non-data lines.
-pub fn parse_line(line: &[u8], out: &mut Vec<f64>) -> Option<String> {
+#[derive(Debug, PartialEq)]
+pub enum Parsed {
+    Empty,
+    /// A text line from the board (shown in the device log).
+    Text(String),
+    /// A data frame; `ok` is false if it was damaged (missing start/end marker
+    /// or a value that is not a number).
+    Frame { ok: bool },
+}
+
+/// Parses one line. Samples go into `out`.
+pub fn parse_line(line: &[u8], out: &mut Vec<f64>) -> Parsed {
     let line = line.trim_ascii();
     if line.is_empty() {
-        return None;
+        return Parsed::Empty;
     }
     let Some(s) = find(line, b"$DB") else {
-        return Some(String::from_utf8_lossy(line).into_owned());
+        if find(line, b"$DE").is_some() {
+            return Parsed::Frame { ok: false }; // start of the frame was lost
+        }
+        return Parsed::Text(String::from_utf8_lossy(line).into_owned());
     };
     let body = &line[s + 3..];
-    let e = find(body, b"$DE")?; // incomplete frame: drop it
+    let Some(e) = find(body, b"$DE") else {
+        return Parsed::Frame { ok: false }; // end of the frame was lost: drop it
+    };
+    let mut ok = s == 0 || line[..s].trim_ascii().is_empty();
     for field in body[..e].split(|&b| b == b',') {
         let f = field.trim_ascii();
         if f.is_empty() {
             continue;
         }
-        if let Some(v) = std::str::from_utf8(f).ok().and_then(|t| t.parse::<f64>().ok()) {
-            out.push(v);
+        match std::str::from_utf8(f).ok().and_then(|t| t.parse::<f64>().ok()) {
+            Some(v) => out.push(v),
+            None => ok = false,
         }
     }
-    None
+    Parsed::Frame { ok }
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -392,10 +453,14 @@ mod tests {
     #[test]
     fn parses_frames() {
         let mut v = Vec::new();
-        assert_eq!(parse_line(b"$DB1.5, 2,3.25,$DE\r", &mut v), None);
+        assert_eq!(parse_line(b"$DB1.5, 2,3.25,$DE\r", &mut v), Parsed::Frame { ok: true });
         assert_eq!(v, vec![1.5, 2.0, 3.25]);
-        assert_eq!(parse_line(b"hello board", &mut v).as_deref(), Some("hello board"));
-        assert_eq!(parse_line(b"$DB1,2", &mut v), None); // incomplete -> dropped
+        assert_eq!(parse_line(b"hello board", &mut v), Parsed::Text("hello board".into()));
+        assert_eq!(parse_line(b"$DB1,2", &mut v), Parsed::Frame { ok: false }); // end lost -> dropped
+        assert_eq!(parse_line(b"5,6$DE", &mut v), Parsed::Frame { ok: false }); // start lost
         assert_eq!(v.len(), 3);
+        assert_eq!(parse_line(b"$DB7,x8,9$DE", &mut v), Parsed::Frame { ok: false }); // bad value
+        assert_eq!(v, vec![1.5, 2.0, 3.25, 7.0, 9.0]);
+        assert_eq!(parse_line(b"  ", &mut v), Parsed::Empty);
     }
 }

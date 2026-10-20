@@ -170,6 +170,25 @@ impl Series {
         r
     }
 
+    /// (count, sum) of the values below `thr`, and of those at or above it, in [a, b).
+    pub fn split(&self, a: usize, b: usize, thr: f64) -> ((usize, f64), (usize, f64)) {
+        let b = b.min(self.len());
+        let (mut lo, mut hi) = ((0usize, 0.0f64), (0usize, 0.0f64));
+        if a >= b {
+            return (lo, hi);
+        }
+        for &v in &self.v[a..b] {
+            if v < thr {
+                lo.0 += 1;
+                lo.1 += v;
+            } else {
+                hi.0 += 1;
+                hi.1 += v;
+            }
+        }
+        (lo, hi)
+    }
+
     fn bytes(&self) -> usize {
         self.v.capacity() * 8 + self.blocks.capacity() * std::mem::size_of::<Agg>()
     }
@@ -185,6 +204,8 @@ pub struct DataStore {
     filter: FilterCfg,
     dt: f64,
     pub next_index: f64,
+    /// Changes whenever the data changes (for caching derived results).
+    pub generation: u64,
 }
 
 impl Default for DataStore {
@@ -196,6 +217,7 @@ impl Default for DataStore {
             filter: FilterCfg::default(),
             dt: 1e-3,
             next_index: 0.0,
+            generation: 0,
         }
     }
 }
@@ -214,6 +236,7 @@ impl DataStore {
         self.raw.clear();
         self.filt.clear();
         self.next_index = 0.0;
+        self.generation += 1;
     }
 
     pub fn bytes(&self) -> usize {
@@ -243,6 +266,7 @@ impl DataStore {
     }
 
     fn recompute_filter(&mut self) {
+        self.generation += 1;
         self.filt.clear();
         if self.filter.active() && !self.raw.v.is_empty() {
             let vals = filter::apply(&self.filter, self.dt, &self.raw.v, 0, None);
@@ -276,6 +300,7 @@ impl DataStore {
             self.next_index += 1.0;
         }
         self.extend_filter(old_n);
+        self.generation += 1;
         k
     }
 

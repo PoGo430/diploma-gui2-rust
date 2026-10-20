@@ -1,0 +1,56 @@
+name: Release
+
+# Push a tag like v2.0.1 to build the Linux packages and publish a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install zig and cargo-zigbuild
+        run: pip install ziglang cargo-zigbuild
+
+      - name: Test
+        run: cargo test --release
+
+      # glibc 2.27 target: runs on Ubuntu 18.04 / Debian 10 and newer
+      - name: Build
+        run: |
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.27
+          cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.27
+
+      - name: Package
+        run: |
+          mkdir dist
+          for T in x86_64 aarch64; do
+            D=dist/analizator-linux-$T
+            mkdir -p $D
+            cp target/$T-unknown-linux-gnu/release/analizator $D/
+            cp packaging/install.sh packaging/README.txt assets/analizator.png $D/
+            chmod +x $D/analizator $D/install.sh
+            tar -C dist -czf dist/analizator-linux-$T.tar.gz analizator-linux-$T
+          done
+          ls -la dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Analizator ${{ github.ref_name }}
+          body_path: .github/release-notes.md
+          files: dist/*.tar.gz

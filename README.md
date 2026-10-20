@@ -80,3 +80,14 @@ sudo usermod -aG dialout $USER   # then log out and back in
 | `src/serial.rs` | Port listing, reader thread, frame parser, DEMO board |
 | `src/csvio.rs` | CSV load/save |
 | `src/fmt.rs` | SI-prefix number formatting |
+
+## Releases
+
+Ready-to-run Linux packages are on the [Releases](../../releases) page. To publish a new version, push a tag:
+
+```sh
+git tag v2.0.1
+git push origin v2.0.1
+```
+
+The [release workflow](.github/workflows/release.yml) then tests, builds the x86_64 and arm64 packages, and publishes the release automatically.

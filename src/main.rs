@@ -4,6 +4,7 @@
 mod app;
 mod csvio;
 mod data;
+mod filter;
 mod fmt;
 mod serial;
 

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::csvio;
 use crate::data::{DataStore, MAX_SAMPLES};
+use crate::filter::{FilterCfg, FilterKind, MAX_AVG_WINDOW, MAX_MEDIAN_WINDOW};
 use crate::fmt;
 use crate::serial::{self, Connection, DEMO_PORT, Msg, PortInfo};
 
@@ -55,6 +56,9 @@ pub struct Settings {
     follow: bool,
     show_power: bool,
     show_overview: bool,
+    filter: FilterCfg,
+    show_raw: bool,
+    stats_filtered: bool,
 }
 
 impl Default for Settings {
@@ -69,6 +73,9 @@ impl Default for Settings {
             follow: true,
             show_power: true,
             show_overview: true,
+            filter: FilterCfg::default(),
+            show_raw: true,
+            stats_filtered: false,
         }
     }
 }
@@ -164,6 +171,9 @@ pub struct AnalyzerApp {
     last_port_scan: Instant,
     title: String,
     decim: Vec<(f64, f64)>,
+    decim_raw: Vec<(f64, f64)>,
+    /// Filter settings being edited (applied when a drag ends, to avoid recomputing every frame).
+    filter_edit: FilterCfg,
 }
 
 impl AnalyzerApp {
@@ -223,7 +233,12 @@ impl AnalyzerApp {
             last_port_scan: Instant::now(),
             title: String::new(),
             decim: Vec::new(),
+            decim_raw: Vec::new(),
+            filter_edit: FilterCfg::default(),
         };
+        app.s.filter = app.s.filter.sanitized();
+        app.filter_edit = app.s.filter;
+        app.store.set_filter(app.s.filter, app.dt());
         app.view = (0.0, app.s.live_window_s / app.dt());
         let d = app.logs_dir.display().to_string();
         app.log(format!("Captures are saved to {d}"), MUTED);
@@ -366,7 +381,7 @@ impl AnalyzerApp {
         if b > a {
             let name = format!("power_capture_log_{}.csv", chrono::Local::now().format("%Y%m%d_%H%M%S"));
             let path = self.logs_dir.join(name);
-            self.save_async(path, a, b);
+            self.save_async(path, a, b, false);
         } else {
             self.status = "Capture stopped (no samples received).".into();
         }
@@ -401,7 +416,7 @@ impl AnalyzerApp {
             self.log(format!("Flash dump finished: {} samples", fmt::count(n)), GREEN);
             let name = format!("flash_dump_{}.csv", chrono::Local::now().format("%Y%m%d_%H%M%S"));
             let path = self.logs_dir.join(name);
-            self.save_async(path, 0, n);
+            self.save_async(path, 0, n, false);
         } else {
             self.log("Flash dump: no data received", AMBER);
             self.status = "Flash dump: no data received.".into();
@@ -444,14 +459,16 @@ impl AnalyzerApp {
     }
 
     // ------------------------------------------------------------ files ---
-    fn save_async(&mut self, path: PathBuf, a: usize, b: usize) {
+    /// Save samples [a, b) in the background. `with_filtered` adds a filtered-current column.
+    fn save_async(&mut self, path: PathBuf, a: usize, b: usize, with_filtered: bool) {
         let x = self.store.x[a..b].to_vec();
-        let i = self.store.i[a..b].to_vec();
+        let i = self.store.raw.v[a..b].to_vec();
+        let f = (with_filtered && self.store.filter_active()).then(|| self.store.filt.v[a..b].to_vec());
         let v = self.s.voltage;
         self.busy = Some(format!("Saving {} samples…", fmt::count(b - a)));
         let tx = self.jobs_tx.clone();
         std::thread::spawn(move || {
-            let r = match csvio::save(&path, &x, &i, v) {
+            let r = match csvio::save(&path, &x, &i, f.as_deref(), v) {
                 Ok(n) => Job::Saved(path, n),
                 Err(e) => Job::Failed(e),
             };
@@ -507,7 +524,7 @@ impl AnalyzerApp {
                     return;
                 }
                 let path = if path.extension().is_none() { path.with_extension("csv") } else { path };
-                self.save_async(path, a, b);
+                self.save_async(path, a, b, true);
             }
             None => {}
         }
@@ -549,6 +566,7 @@ impl AnalyzerApp {
 
     // ------------------------------------------------------- per frame ---
     fn poll(&mut self, ctx: &egui::Context) {
+        self.store.set_filter(self.s.filter, self.dt());
         // serial messages
         let mut msgs = Vec::new();
         if let Some(c) = &self.conn {
@@ -610,7 +628,7 @@ impl AnalyzerApp {
                 let (a, b) = self.store.index_range(self.record_start, f64::INFINITY);
                 if b > a {
                     let name = format!("power_capture_log_{}.csv", chrono::Local::now().format("%Y%m%d_%H%M%S"));
-                    let _ = csvio::save(&self.logs_dir.join(name), &self.store.x[a..b], &self.store.i[a..b], self.s.voltage);
+                    let _ = csvio::save(&self.logs_dir.join(name), &self.store.x[a..b], &self.store.raw.v[a..b], None, self.s.voltage);
                 }
                 self.mode = self.after_recording_mode();
             }
@@ -817,6 +835,9 @@ impl AnalyzerApp {
             });
 
             ui.add_space(8.0);
+            group(ui, "FILTER", |ui| self.filter_ui(ui));
+
+            ui.add_space(8.0);
             group(ui, "STATISTICS", |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Range").color(MUTED));
@@ -839,6 +860,10 @@ impl AnalyzerApp {
                         self.set_scope(scope);
                     }
                 });
+                if self.store.filter_active() {
+                    ui.checkbox(&mut self.s.stats_filtered, "Use filtered data")
+                        .on_hover_text("Off: statistics come from the raw samples (recommended for charge/energy).\nOn: from the filtered signal, e.g. for sustained peak current.");
+                }
                 ui.add_space(6.0);
                 self.stats_tiles(ui);
                 ui.add_space(6.0);
@@ -880,18 +905,94 @@ impl AnalyzerApp {
         });
     }
 
+    fn filter_ui(&mut self, ui: &mut Ui) {
+        let dt = self.dt();
+        let mut kind = self.s.filter.kind;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.selectable_value(&mut kind, FilterKind::Off, "Off");
+            ui.selectable_value(&mut kind, FilterKind::MovingAverage, "Average")
+                .on_hover_text("Moving average: smooths noise.\nCentered window, so pulses are not shifted in time.");
+            ui.selectable_value(&mut kind, FilterKind::Median, "Median")
+                .on_hover_text("Median: removes short spikes and glitches but keeps sharp edges.");
+            ui.selectable_value(&mut kind, FilterKind::LowPass, "Low-pass")
+                .on_hover_text("First-order low-pass, like an RC filter or an oscilloscope's bandwidth limit.");
+        });
+        if kind != self.s.filter.kind {
+            self.s.filter.kind = kind;
+            self.s.filter = self.s.filter.sanitized();
+            self.filter_edit = self.s.filter;
+        }
+        let mut apply = false;
+        match kind {
+            FilterKind::Off => {
+                ui.label(RichText::new("Raw data is shown. Filters only change the display; recordings are always saved unfiltered.").color(MUTED).size(12.0));
+            }
+            FilterKind::MovingAverage | FilterKind::Median => {
+                let max = if kind == FilterKind::Median { MAX_MEDIAN_WINDOW } else { MAX_AVG_WINDOW };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Window").color(MUTED));
+                    let r = ui.add(egui::DragValue::new(&mut self.filter_edit.window).range(3..=max).speed(0.5).suffix(" samples"));
+                    apply |= r.drag_stopped() || (r.changed() && !r.dragged());
+                    ui.label(RichText::new(format!("= {}", fmt::si((self.filter_edit.window | 1) as f64 * dt, "s"))).color(MUTED));
+                });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for t in [1e-3, 5e-3, 20e-3, 100e-3, 1.0] {
+                        let w = (((t / dt).round() as usize) | 1).clamp(3, max);
+                        if ui.small_button(fmt::si_digits(t, "s", 3)).on_hover_text(format!("{w} samples")).clicked() {
+                            self.filter_edit.window = w;
+                            apply = true;
+                        }
+                    }
+                });
+            }
+            FilterKind::LowPass => {
+                let nyquist = 0.5 / dt;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Cut-off").color(MUTED));
+                    let speed = (self.filter_edit.cutoff_hz * 0.01).max(0.001);
+                    let r = ui.add(
+                        egui::DragValue::new(&mut self.filter_edit.cutoff_hz).range(0.001..=nyquist).speed(speed).max_decimals(3).suffix(" Hz"),
+                    );
+                    apply |= r.drag_stopped() || (r.changed() && !r.dragged());
+                    let tau = 1.0 / (std::f64::consts::TAU * self.filter_edit.cutoff_hz.max(1e-9));
+                    ui.label(RichText::new(format!("τ = {}", fmt::si(tau, "s")))).on_hover_text("Time constant (RC)");
+                });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for f in [1.0, 10.0, 50.0, 100.0, 1000.0] {
+                        if f < nyquist && ui.small_button(fmt::si_digits(f, "Hz", 3)).clicked() {
+                            self.filter_edit.cutoff_hz = f;
+                            apply = true;
+                        }
+                    }
+                });
+            }
+        }
+        if apply {
+            self.filter_edit.kind = self.s.filter.kind;
+            self.s.filter = self.filter_edit.sanitized();
+            self.filter_edit = self.s.filter;
+        }
+        if kind != FilterKind::Off {
+            ui.checkbox(&mut self.s.show_raw, "Show raw data behind");
+        }
+    }
+
     fn stats_tiles(&self, ui: &mut Ui) {
         let n = self.store.len();
+        let series = self.store.series(self.s.stats_filtered);
         let g = match self.scope {
             _ if n == 0 => None,
-            Scope::All => Some(self.store.total),
+            Scope::All => Some(series.total),
             Scope::Selection => {
                 let (a, b) = self.store.index_range(self.sel.0, self.sel.1);
-                Some(self.store.agg(a, b))
+                Some(series.agg(a, b))
             }
             Scope::Visible => {
                 let (a, b) = self.store.index_range(self.view.0, self.view.1);
-                Some(self.store.agg(a, b))
+                Some(series.agg(a, b))
             }
         };
         let g = g.filter(|g| g.count > 0);
@@ -948,9 +1049,19 @@ impl AnalyzerApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             ui.label(RichText::new(where_).monospace().color(MUTED));
-            ui.label(RichText::new(format!("I = {}", fmt::si(self.store.i[k] * 1e-6, "A"))).monospace().color(CURRENT_C));
-            ui.label(RichText::new(format!("P = {}", fmt::si(self.store.i[k] * self.s.voltage * 1e-6, "W"))).monospace().color(POWER_C));
+            let i = self.store.raw.v[k];
+            ui.label(RichText::new(format!("I = {}", fmt::si(i * 1e-6, "A"))).monospace().color(CURRENT_C));
+            ui.label(RichText::new(format!("P = {}", fmt::si(i * self.s.voltage * 1e-6, "W"))).monospace().color(POWER_C));
         });
+        if self.store.filter_active() {
+            let f = self.store.filt.v[k];
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.label(RichText::new("filtered").monospace().color(MUTED));
+                ui.label(RichText::new(format!("I = {}", fmt::si(f * 1e-6, "A"))).monospace().color(CURRENT_C.gamma_multiply(0.8)));
+                ui.label(RichText::new(format!("P = {}", fmt::si(f * self.s.voltage * 1e-6, "W"))).monospace().color(POWER_C.gamma_multiply(0.8)));
+            });
+        }
     }
 
     fn plots(&mut self, ui: &mut Ui) {
@@ -965,10 +1076,18 @@ impl AnalyzerApp {
         let span = (self.view.1 - self.view.0).max(1e-9);
         let (a, b) = self.store.index_range(self.view.0 - span * 0.5, self.view.1 + span * 0.5);
         let buckets = (width_px as usize) * 2;
+        let filtered = self.store.filter_active();
+        let with_raw = filtered && self.s.show_raw;
         let mut decim = std::mem::take(&mut self.decim);
-        self.store.decimate(a, b, buckets, &mut decim);
+        let mut decim_raw = std::mem::take(&mut self.decim_raw);
+        self.store.decimate(self.store.series(true), a, b, buckets, &mut decim);
+        decim_raw.clear();
+        if with_raw {
+            self.store.decimate(&self.store.raw, a, b, buckets, &mut decim_raw);
+        }
         let (va, vb) = self.store.index_range(self.view.0, self.view.1);
-        let g = self.store.agg(va, vb);
+        // Y range follows what is drawn (raw is the wider one when it is shown)
+        let g = self.store.series(!with_raw).agg(va, vb);
         let yr = if g.count > 0 {
             let lo = g.min.min(0.0);
             let hi = g.max.max(lo + 1e-3);
@@ -982,13 +1101,15 @@ impl AnalyzerApp {
         let plots_h = ui.available_height() - ov_space - header_h * (1 + self.s.show_power as usize) as f32
             - if self.s.show_power { 8.0 } else { 0.0 };
         let h_i = if self.s.show_power { plots_h * 0.58 } else { plots_h };
-        plot_header(ui, "CURRENT", CURRENT_C);
-        hovered |= self.main_plot(ui, 0, h_i, &decim, yr);
+        let desc = self.s.filter.describe(self.dt());
+        let raw = with_raw.then_some(decim_raw.as_slice());
+        plot_header(ui, "CURRENT", CURRENT_C, &desc);
+        hovered |= self.main_plot(ui, 0, h_i, &decim, raw, yr);
         if self.s.show_power {
             ui.add_space(8.0);
-            plot_header(ui, "POWER", POWER_C);
+            plot_header(ui, "POWER", POWER_C, &desc);
             let h_p = ui.available_height() - ov_space;
-            hovered |= self.main_plot(ui, 1, h_p, &decim, yr);
+            hovered |= self.main_plot(ui, 1, h_p, &decim, raw, yr);
         }
         if self.s.show_overview {
             ui.add_space(8.0);
@@ -1001,10 +1122,19 @@ impl AnalyzerApp {
             eprintln!("plots: {:.2} ms, {} points, view {:.0} samples", t0.elapsed().as_secs_f64() * 1e3, decim.len(), self.view.1 - self.view.0);
         }
         self.decim = decim;
+        self.decim_raw = decim_raw;
     }
 
     /// Current (id 0) or power (id 1) plot. Returns true if hovered.
-    fn main_plot(&mut self, ui: &mut Ui, id: usize, height: f32, decim: &[(f64, f64)], yr: (f64, f64)) -> bool {
+    fn main_plot(
+        &mut self,
+        ui: &mut Ui,
+        id: usize,
+        height: f32,
+        decim: &[(f64, f64)],
+        raw: Option<&[(f64, f64)]>,
+        yr: (f64, f64),
+    ) -> bool {
         let scale = self.xscale();
         let factor = if id == 0 { 1e-6 } else { self.s.voltage.max(1e-12) * 1e-6 };
         let (unit, color) = if id == 0 { ("A", CURRENT_C) } else { ("W", POWER_C) };
@@ -1061,6 +1191,7 @@ impl AnalyzerApp {
         }
 
         let pts: Vec<[f64; 2]> = decim.iter().map(|&(x, y)| [x * scale, y * factor]).collect();
+        let raw_pts: Option<Vec<[f64; 2]>> = raw.map(|r| r.iter().map(|&(x, y)| [x * scale, y * factor]).collect());
         let bounds = PlotBounds::from_min_max([self.view.0 * scale, yr.0 * factor], [self.view.1 * scale, yr.1 * factor]);
         let sel = (self.scope == Scope::Selection).then(|| (self.sel.0 * scale, self.sel.1 * scale));
         let hover = self.hover_x.and_then(|x| self.store.nearest(x)).map(|k| self.store.x[k] * scale);
@@ -1085,6 +1216,9 @@ impl AnalyzerApp {
                 pu.set_plot_bounds(bounds);
                 if let Some((l, r)) = sel {
                     pu.span(Span::new("", l..=r).fill(RED.gamma_multiply(0.12)).border(Stroke::new(1.5, RED)));
+                }
+                if let Some(rp) = raw_pts {
+                    pu.line(Line::new("", PlotPoints::new(rp)).color(color.gamma_multiply(0.28)).width(1.0));
                 }
                 pu.line(Line::new("", PlotPoints::new(pts)).color(color).width(1.0).fill(0.0).fill_alpha(0.10));
                 if let Some(hx) = hover {
@@ -1150,12 +1284,13 @@ impl AnalyzerApp {
     fn overview(&mut self, ui: &mut Ui, height: f32, width_px: f32) -> bool {
         let scale = self.xscale();
         let mut decim = Vec::new();
-        self.store.decimate(0, self.store.len(), width_px as usize, &mut decim);
+        let series = self.store.series(true);
+        self.store.decimate(series, 0, self.store.len(), width_px as usize, &mut decim);
         let pts: Vec<[f64; 2]> = decim.iter().map(|&(x, y)| [x * scale, y * 1e-6]).collect();
         let (x0, x1) = if self.store.is_empty() { self.view } else { (self.store.first_x(), self.store.last_x()) };
         let pad = ((x1 - x0) * 0.01).max(1.0);
-        let ymax = if self.store.is_empty() { 1e-5 } else { self.store.total.max.max(1.0) * 1e-6 * 1.1 };
-        let ymin = if self.store.is_empty() { 0.0 } else { self.store.total.min.min(0.0) * 1e-6 };
+        let ymax = if self.store.is_empty() { 1e-5 } else { series.total.max.max(1.0) * 1e-6 * 1.1 };
+        let ymin = if self.store.is_empty() { 0.0 } else { series.total.min.min(0.0) * 1e-6 };
         let bounds = PlotBounds::from_min_max([(x0 - pad) * scale, ymin], [(x1 + pad) * scale, ymax]);
         let view = (self.view.0 * scale, self.view.1 * scale);
         let hover = self.hover_x.and_then(|x| self.store.nearest(x)).map(|k| self.store.x[k] * scale);
@@ -1365,12 +1500,16 @@ fn tile(ui: &mut Ui, title: &str, value: &str, color: Color32, width: f32) {
         });
 }
 
-fn plot_header(ui: &mut Ui, title: &str, color: Color32) {
+fn plot_header(ui: &mut Ui, title: &str, color: Color32, filter: &str) {
     ui.horizontal(|ui| {
         ui.add_space(74.0);
         let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), egui::Sense::hover());
         ui.painter().circle_filled(rect.center(), 4.0, color);
         ui.label(RichText::new(title).strong().size(11.5).color(MUTED));
+        if !filter.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("filtered: {filter}")).size(11.5).color(ACCENT));
+        }
     });
 }
 

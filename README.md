@@ -27,6 +27,7 @@ If connecting fails with "Permission denied", run `sudo usermod -aG dialout $USE
 - Live capture with current and power plots plus an overview strip for navigating long recordings
 - Min/max ("peak") decimation, so short current spikes stay visible at any zoom level; stays smooth with tens of millions of samples
 - Statistics for the whole capture, a selection, or the visible window: duration, avg/RMS/peak/min current, avg/peak power, charge, energy
+- Display filters: **moving average**, **median** (removes glitches, keeps edges) and **first-order low-pass** (RC-like), with the raw signal shown faintly behind; statistics can use raw or filtered data
 - Hover readout of time, current and power at the cursor
 - Flash dump / erase, auto-save of every capture to CSV, CSV import and export
 - Built-in **DEMO** device for trying the app without hardware
@@ -39,7 +40,7 @@ If connecting fails with "Permission denied", run `sudo usermod -aG dialout $USE
 | Board → PC | `$DB<v1>,<v2>,...,<vN>$DE\n`: current samples in µA. Any other line is shown in the device log. |
 | PC → board | `START`, `STOP`, `DUMP`, `ERASE` (newline terminated) |
 
-CSV format: `Index,Current_uA,Voltage_V,Power_uW`
+CSV format: `Index,Current_uA,Voltage_V,Power_uW`. Files exported while a filter is active have an extra `Current_filtered_uA` column; auto-saved recordings are always raw.
 
 ## Controls
 
@@ -96,6 +97,7 @@ sudo usermod -aG dialout $USER   # then log out and back in
 | `src/app.rs` | User interface, plotting, capture logic |
 | `src/data.rs` | Sample storage with per-256-sample min/max/sum blocks (fast drawing and statistics) |
 | `src/serial.rs` | Port listing, reader thread, frame parser, DEMO board |
+| `src/filter.rs` | Moving average, median and low-pass filters |
 | `src/csvio.rs` | CSV load/save |
 | `src/fmt.rs` | SI-prefix number formatting |
 

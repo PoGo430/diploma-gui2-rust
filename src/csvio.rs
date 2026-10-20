@@ -5,7 +5,8 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-pub fn save(path: &Path, x: &[f64], i: &[f64], voltage: f64) -> Result<usize, String> {
+/// `filtered`: optional extra column with the filtered current (export only).
+pub fn save(path: &Path, x: &[f64], i: &[f64], filtered: Option<&[f64]>, voltage: f64) -> Result<usize, String> {
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
             fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
@@ -14,11 +15,12 @@ pub fn save(path: &Path, x: &[f64], i: &[f64], voltage: f64) -> Result<usize, St
     let f = fs::File::create(path).map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
     let mut w = BufWriter::with_capacity(1 << 20, f);
     let werr = |e: std::io::Error| format!("Write error: {e}");
-    w.write_all(b"Index,Current_uA,Voltage_V,Power_uW\n").map_err(werr)?;
+    w.write_all(b"Index,Current_uA,Voltage_V,Power_uW").map_err(werr)?;
+    w.write_all(if filtered.is_some() { b",Current_filtered_uA\n".as_slice() } else { b"\n".as_slice() }).map_err(werr)?;
     let mut v_txt = Vec::new();
     push_fixed(&mut v_txt, voltage, 3);
     let mut line = Vec::with_capacity(64 * 1024);
-    for (xv, iv) in x.iter().zip(i) {
+    for (k, (xv, iv)) in x.iter().zip(i).enumerate() {
         push_int(&mut line, xv.round() as i64);
         line.push(b',');
         push_fixed(&mut line, *iv, 4);
@@ -26,6 +28,10 @@ pub fn save(path: &Path, x: &[f64], i: &[f64], voltage: f64) -> Result<usize, St
         line.extend_from_slice(&v_txt);
         line.push(b',');
         push_fixed(&mut line, iv * voltage, 4);
+        if let Some(f) = filtered {
+            line.push(b',');
+            push_fixed(&mut line, f[k], 4);
+        }
         line.push(b'\n');
         if line.len() > 60 * 1024 {
             w.write_all(&line).map_err(werr)?;
@@ -145,7 +151,11 @@ mod tests {
     fn roundtrip() {
         let dir = std::env::temp_dir().join("analizator_test");
         let p = dir.join("t.csv");
-        save(&p, &[0.0, 1.0, 2.0], &[1.5, 2.25, 1000.0], 3.3).unwrap();
+        save(&p, &[0.0, 1.0, 2.0], &[1.5, 2.25, 1000.0], None, 3.3).unwrap();
+        let l = load(&p).unwrap();
+        assert_eq!(l.i, vec![1.5, 2.25, 1000.0]);
+        // file with the extra filtered column loads the raw current
+        save(&p, &[0.0, 1.0, 2.0], &[1.5, 2.25, 1000.0], Some(&[9.0, 9.0, 9.0]), 3.3).unwrap();
         let l = load(&p).unwrap();
         assert_eq!(l.x, vec![0.0, 1.0, 2.0]);
         assert_eq!(l.i, vec![1.5, 2.25, 1000.0]);
@@ -177,7 +187,7 @@ mod bench {
         eprintln!("loaded {} rows in {:.2} s", l.i.len(), t.elapsed().as_secs_f64());
         let t = std::time::Instant::now();
         let out = std::env::temp_dir().join("big_out.csv");
-        super::save(&out, &l.x, &l.i, 3.3).unwrap();
+        super::save(&out, &l.x, &l.i, None, 3.3).unwrap();
         eprintln!("saved in {:.2} s", t.elapsed().as_secs_f64());
     }
 }

@@ -31,7 +31,7 @@ pub struct PortInfo {
 
 /// List serial ports. On Linux this reads /sys directly (no libudev needed).
 pub fn list_ports() -> Vec<PortInfo> {
-    let mut out = Vec::new();
+    let mut out: Vec<PortInfo> = Vec::new();
     #[cfg(target_os = "linux")]
     {
         if let Ok(rd) = std::fs::read_dir("/sys/class/tty") {
@@ -69,13 +69,31 @@ pub fn list_ports() -> Vec<PortInfo> {
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // Windows / macOS: e.g. "COM3  —  STMicroelectronics Virtual COM Port"
         if let Ok(ports) = serialport::available_ports() {
             for p in ports {
-                out.push(PortInfo { label: p.port_name.clone(), path: p.port_name, desc: String::new() });
+                let desc = match &p.port_type {
+                    serialport::SerialPortType::UsbPort(u) => {
+                        let (m, pr) = (u.manufacturer.clone().unwrap_or_default(), u.product.clone().unwrap_or_default());
+                        let d = if m.is_empty() || pr.starts_with(&m) { pr } else { format!("{m} {pr}") };
+                        if d.trim().is_empty() { format!("USB {:04x}:{:04x}", u.vid, u.pid) } else { d.trim().to_string() }
+                    }
+                    serialport::SerialPortType::BluetoothPort => "Bluetooth".to_string(),
+                    _ => String::new(),
+                };
+                let label = if desc.is_empty() { p.port_name.clone() } else { format!("{}  —  {desc}", p.port_name) };
+                out.push(PortInfo { label, path: p.port_name, desc });
             }
         }
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
+    // natural order: COM2 before COM10, ttyUSB2 before ttyUSB10
+    out.sort_by(|a, b| {
+        let split = |s: &str| {
+            let t = s.trim_end_matches(|c: char| c.is_ascii_digit());
+            (t.to_string(), s[t.len()..].parse::<u64>().unwrap_or(0))
+        };
+        split(&a.path).cmp(&split(&b.path))
+    });
     out
 }
 
@@ -149,9 +167,12 @@ impl Connection {
             .open()
             .map_err(|e| {
                 let mut msg = format!("Could not open {path}: {e}");
-                if matches!(e.kind(), serialport::ErrorKind::Io(io::ErrorKind::PermissionDenied))
+                let denied = matches!(e.kind(), serialport::ErrorKind::Io(io::ErrorKind::PermissionDenied))
                     || e.to_string().to_lowercase().contains("permission")
-                {
+                    || e.to_string().to_lowercase().contains("access is denied");
+                if denied && cfg!(target_os = "windows") {
+                    msg.push_str("\n\nThe port is probably open in another program (serial monitor, IDE, another Analizator window). Close it and try again.");
+                } else if denied {
                     msg.push_str(
                         "\n\nYour user is probably not allowed to use serial ports. Run this once and log out/in:\n    sudo usermod -aG dialout $USER",
                     );

@@ -16,7 +16,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-pc-windows-gnu
 
       - uses: Swatinem/rust-cache@v2
 
@@ -24,8 +24,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install zig and cargo-zigbuild
-        run: pip install ziglang cargo-zigbuild
+      - name: Install zig, cargo-zigbuild and MinGW (Windows cross-compiler)
+        run: |
+          pip install ziglang cargo-zigbuild
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 zip
 
       - name: Test
         run: cargo test --release
@@ -35,6 +38,7 @@ jobs:
         run: |
           cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.27
           cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.27
+          cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Package
         run: |
@@ -47,10 +51,16 @@ jobs:
             chmod +x $D/analizator $D/install.sh
             tar -C dist -czf dist/analizator-linux-$T.tar.gz analizator-linux-$T
           done
+          mkdir -p dist/Analizator
+          cp target/x86_64-pc-windows-gnu/release/analizator.exe dist/Analizator/Analizator.exe
+          sed 's/$/\r/' packaging/README-windows.txt > dist/Analizator/README.txt
+          (cd dist && zip -9 -r analizator-windows-x86_64.zip Analizator)
           ls -la dist
 
       - uses: softprops/action-gh-release@v2
         with:
           name: Analizator ${{ github.ref_name }}
           body_path: .github/release-notes.md
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/*.zip

@@ -1,6 +1,6 @@
 # Analizator — current & power analyzer GUI
 
-Desktop app for capturing and analysing current measurements from the Analizator board over a serial port. Written in Rust ([egui](https://github.com/emilk/egui) + [egui_plot](https://github.com/emilk/egui_plot)); compiles to a single Linux executable with no runtime dependencies besides the system C library.
+Desktop app for capturing and analysing current measurements from the Analizator board over a serial port. Written in Rust ([egui](https://github.com/emilk/egui) + [egui_plot](https://github.com/emilk/egui_plot)); compiles to a single executable for Linux or Windows with nothing else to install.
 
 ![screenshot](docs/screenshot.png)
 
@@ -10,8 +10,11 @@ Desktop app for capturing and analysing current measurements from the Analizator
 |---|---|
 | **[analizator-linux-x86_64.tar.gz](https://github.com/PoGo430/diploma-gui2-rust/raw/main/download/analizator-linux-x86_64.tar.gz)** | Normal PCs and laptops (64-bit Intel/AMD) |
 | [analizator-linux-aarch64.tar.gz](https://github.com/PoGo430/diploma-gui2-rust/raw/main/download/analizator-linux-aarch64.tar.gz) | Raspberry Pi 4/5 with 64-bit OS |
+| **[analizator-windows-x86_64.zip](https://github.com/PoGo430/diploma-gui2-rust/raw/main/download/analizator-windows-x86_64.zip)** | Windows 10/11 (64-bit) |
 
-Runs on any 64-bit Linux with glibc 2.27+ (Ubuntu 18.04, Debian 10, Fedora 28 or newer); nothing else to install.
+**Windows:** extract the zip and double-click `Analizator.exe`. The first time, Windows may say "Windows protected your PC" because the program isn't signed: click *More info → Run anyway*. The board appears as a COM port.
+
+**Linux:** runs on any 64-bit Linux with glibc 2.27+ (Ubuntu 18.04, Debian 10, Fedora 28 or newer); nothing else to install.
 
 ```sh
 tar xzf analizator-linux-x86_64.tar.gz
@@ -105,6 +108,17 @@ rustup target add aarch64-unknown-linux-gnu
 cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.27
 ```
 
+### Windows build (cross-compiled from Linux)
+
+```sh
+sudo apt install mingw-w64
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu
+# -> target/x86_64-pc-windows-gnu/release/analizator.exe (icon embedded by build.rs)
+```
+
+On Windows itself, `cargo build --release` works too.
+
 ### Packaging
 
 Put the binary next to `packaging/install.sh`, `packaging/README.txt` and `assets/analizator.png`, then archive it with `tar czf` (this keeps the executable bit). Users run `./install.sh` to add a menu entry and desktop icon; `./install.sh --remove` uninstalls.
@@ -138,7 +152,7 @@ git tag v2.0.1
 git push origin v2.0.1
 ```
 
-The [release workflow](.github/workflows/release.yml) then tests, builds the x86_64 and arm64 packages, and publishes the release automatically.
+The [release workflow](.github/workflows/release.yml) then tests, builds the Linux (x86_64, arm64) and Windows packages, and publishes the release automatically.
 
 ## Testing without the board
 

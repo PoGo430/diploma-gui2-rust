@@ -404,7 +404,12 @@ impl AnalyzerApp {
         }
         r.last_try = Instant::now();
         // same device path, or (if it came back under another name) the same USB device
-        let candidate = if Path::new(&r.path).exists() {
+        let present = if cfg!(target_os = "linux") {
+            Path::new(&r.path).exists()
+        } else {
+            serial::list_ports().iter().any(|p| p.path == r.path)
+        };
+        let candidate = if present {
             Some(r.path.clone())
         } else if !r.desc.is_empty() {
             serial::list_ports().into_iter().find(|p| p.desc == r.desc).map(|p| p.path)
@@ -1052,7 +1057,7 @@ impl AnalyzerApp {
                 ui.horizontal(|ui| {
                     if ui.small_button("Open logs folder").on_hover_text(self.logs_dir.display().to_string()).clicked() {
                         let _ = std::fs::create_dir_all(&self.logs_dir);
-                        let _ = std::process::Command::new("xdg-open").arg(&self.logs_dir).spawn();
+                        open_folder(&self.logs_dir);
                     }
                     if ui.small_button("Clear").clicked() {
                         self.log.clear();
@@ -1986,7 +1991,8 @@ fn pick_logs_dir() -> PathBuf {
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let usable = exe_dir.as_ref().is_some_and(|d| {
         let s = d.to_string_lossy();
-        !s.contains("/.") && !s.starts_with("/usr") && !s.starts_with("/opt")
+        let lower = s.to_lowercase();
+        !s.contains("/.") && !s.starts_with("/usr") && !s.starts_with("/opt") && !lower.contains("\\program files")
     });
     if let Some(dir) = exe_dir.filter(|_| usable).map(|d| d.join("logs")) {
         if std::fs::create_dir_all(&dir).is_ok() {
@@ -1997,11 +2003,29 @@ fn pick_logs_dir() -> PathBuf {
             }
         }
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join("Analizator").join("logs")
 }
 
+/// Show a folder in the system file manager.
+fn open_folder(dir: &Path) {
+    let _ = std::fs::create_dir_all(dir);
+    let cmd = if cfg!(target_os = "windows") {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(cmd).arg(dir).spawn();
+}
+
 fn apply_theme(ctx: &egui::Context) {
+    // always use our dark theme, even when the system (e.g. Windows) is set to light mode
+    ctx.set_theme(egui::ThemePreference::Dark);
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
     v.window_fill = PANEL;

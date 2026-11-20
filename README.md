@@ -158,6 +158,11 @@ decoder → device. Adding a device, changing the board's protocol or moving it 
 touches `src/device/`. **[DEVELOPING.md](DEVELOPING.md)** explains the structure and has
 step-by-step recipes with code skeletons.
 
+**Changing the code with an AI assistant?** Point it at **[AGENTS.md](AGENTS.md)** (or paste that
+file into the chat first). It has everything it needs: what the project is, decisions already made
+(features not wanted), structure, protocols, conventions and the build/release checklist.
+`packaging/build-packages.sh` rebuilds the files in `download/`.
+
 ## Releases
 
 Ready-to-run Linux packages are on the [Releases](../../releases) page. To publish a new version, push a tag:

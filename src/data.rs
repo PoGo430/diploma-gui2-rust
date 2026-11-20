@@ -122,8 +122,8 @@ impl Series {
         if !len.is_multiple_of(BLOCK) {
             let s = (nb - 1) * BLOCK;
             let mut b = Agg::EMPTY;
-            for k in s..len {
-                b.add(k, self.v[k]);
+            for (k, &v) in self.v[s..len].iter().enumerate() {
+                b.add(s + k, v);
             }
             self.blocks[nb - 1] = b;
         }
@@ -147,19 +147,20 @@ impl Series {
         let first_full = a.div_ceil(BLOCK);
         let last_full = b / BLOCK; // exclusive
         if first_full >= last_full {
-            for k in a..b {
-                r.add(k, self.v[k]);
+            for (k, &v) in self.v[a..b].iter().enumerate() {
+                r.add(a + k, v);
             }
             return r;
         }
-        for k in a..first_full * BLOCK {
-            r.add(k, self.v[k]);
+        for (k, &v) in self.v[a..first_full * BLOCK].iter().enumerate() {
+            r.add(a + k, v);
         }
         for blk in &self.blocks[first_full..last_full] {
             r.merge(blk);
         }
-        for k in last_full * BLOCK..b {
-            r.add(k, self.v[k]);
+        let tail = last_full * BLOCK;
+        for (k, &v) in self.v[tail..b].iter().enumerate() {
+            r.add(tail + k, v);
         }
         r
     }

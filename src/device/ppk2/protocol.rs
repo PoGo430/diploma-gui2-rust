@@ -252,9 +252,9 @@ impl Stream {
     pub fn feed(&mut self, bytes: &[u8], vdd_mv: f64, decimation: u32, out: &mut Vec<f64>) {
         let mut data = std::mem::take(&mut self.remainder);
         data.extend_from_slice(bytes);
-        let whole = data.len() / 4 * 4;
-        for w in data[..whole].chunks_exact(4) {
-            let word = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        let (words, rest) = data.as_chunks::<4>();
+        for w in words {
+            let word = u32::from_le_bytes(*w);
             let adc = (word & 0x3fff) as f64 * 4.0;
             let range = (((word >> 14) & 0x7) as usize).min(4);
             let counter = (word >> 18) & 0x3f;
@@ -276,7 +276,7 @@ impl Stream {
             self.last_value = ua;
             self.push_value(ua, decimation, out);
         }
-        self.remainder = data[whole..].to_vec();
+        self.remainder = rest.to_vec();
     }
 }
 

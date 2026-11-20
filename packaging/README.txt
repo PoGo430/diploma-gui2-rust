@@ -17,6 +17,12 @@ SERIAL PORT PERMISSION
   group (install.sh offers to do this):
       sudo usermod -aG dialout $USER      then log out and back in.
 
+NORDIC PPK2
+  A Power Profiler Kit II shows up in the port list as "PPK2 (...)". After
+  connecting, the PPK2 panel sets ampere-/source-meter mode, the supply
+  voltage, device power and the sample rate (100 / 10 / 1 kHz). Power
+  Profiler CSV exports open with "Open CSV...".
+
 NO HARDWARE?
   Pick "DEMO — simulated device" in the port list.
 

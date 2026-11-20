@@ -87,11 +87,18 @@ pub fn save(path: &Path, x: &[f64], i: &[f64], filtered: Option<&[f64]>, meta: &
 }
 
 /// Shortest text that reads back as exactly the same number ("0", "1750.435").
+/// Calculated values (e.g. from a PPK2: "8999.243575375063") are rounded to 4 decimals (0.1 nA).
 fn push_exact(out: &mut Vec<u8>, v: f64) {
     if v == v.trunc() && v.abs() < 1e15 {
         push_int(out, v as i64);
-    } else {
-        let _ = write!(out, "{v}");
+        return;
+    }
+    let start = out.len();
+    let _ = write!(out, "{v}");
+    let frac_digits = out[start..].iter().position(|&c| c == b'.').map(|p| out.len() - start - p - 1).unwrap_or(0);
+    if frac_digits > 4 {
+        out.truncate(start);
+        push_trimmed(out, v, 4);
     }
 }
 
@@ -163,6 +170,8 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     let mut col_x: Option<usize> = None;
     let mut col_i: Option<usize> = None;
     let mut col_v: Option<usize> = None;
+    // time column in ms, e.g. Nordic Power Profiler exports "Timestamp(ms),Current(uA),D0-D7"
+    let mut col_t: Option<usize> = None;
     let mut layout_known = false;
     let mut x = Vec::new();
     let mut i = Vec::new();
@@ -199,6 +208,8 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
                     let n = name.to_ascii_lowercase();
                     if n.starts_with("index") || n == "sample" {
                         col_x = Some(k);
+                    } else if n.starts_with("timestamp") || n == "time(ms)" || n == "time_ms" {
+                        col_t = Some(k);
                     } else if n.starts_with("current") && !n.contains("filtered") && col_i.is_none() {
                         col_i = Some(k);
                     } else if n.starts_with("voltage") {
@@ -223,8 +234,8 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
         let get = |c: Option<usize>| c.and_then(|k| cols.get(k)).and_then(|s| s.parse::<f64>().ok());
         match get(col_i) {
             Some(cur) => {
-                let xi = match col_x {
-                    Some(_) => match get(col_x) {
+                let xi = match col_x.or(col_t) {
+                    Some(_) => match get(col_x.or(col_t)) {
                         Some(v) => v,
                         None => {
                             bad += 1;
@@ -247,6 +258,18 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     }
     if bad > i.len() {
         return Err("This does not look like an Analizator capture file.".into());
+    }
+    // timestamps (ms) -> sample period + sample index
+    if col_x.is_none() && col_t.is_some() && x.len() > 1 {
+        let mut d: Vec<f64> = x.windows(2).take(1000).map(|w| w[1] - w[0]).filter(|v| *v > 0.0).collect();
+        if !d.is_empty() {
+            d.sort_by(f64::total_cmp);
+            let period = d[d.len() / 2];
+            period_ms = period_ms.or(Some(period));
+            for v in x.iter_mut() {
+                *v = (*v / period).round();
+            }
+        }
     }
     // make sure x is sorted (needed for fast lookups)
     if x.windows(2).any(|w| w[1] < w[0]) {
@@ -276,7 +299,7 @@ mod tests {
     #[test]
     fn roundtrip_new_format() {
         let p = tmp("new.csv");
-        let i = [0.0, 1750.435, 2.25, -0.0001, 123456.789012];
+        let i = [0.0, 1750.435, 2.25, -0.0001, 123456.7891];
         save(&p, &[10.0, 11.0, 12.0, 13.0, 14.0], &i, None, &meta()).unwrap();
         let text = fs::read_to_string(&p).unwrap();
         assert!(text.contains("# voltage_V=3.3\n") && text.contains("\nCurrent_uA\n0\n1750.435\n"), "{text}");
@@ -286,6 +309,17 @@ mod tests {
         assert_eq!(l.voltage, Some(3.3));
         assert_eq!(l.period_ms, Some(0.5));
         assert_eq!(l.markers, vec![(11.0, "line break".to_string()), (12.0, "radio TX".to_string())]);
+    }
+
+    #[test]
+    fn long_values_rounded() {
+        let mut b = Vec::new();
+        push_exact(&mut b, 8999.243575375063);
+        b.push(b' ');
+        push_exact(&mut b, 1750.435);
+        b.push(b' ');
+        push_exact(&mut b, 4.98500001);
+        assert_eq!(String::from_utf8(b).unwrap(), "8999.2436 1750.435 4.985");
     }
 
     #[test]
@@ -309,6 +343,16 @@ mod tests {
         fs::write(&p, "5\n6\n7\n").unwrap();
         let l = load(&p).unwrap();
         assert_eq!((l.x, l.i), (vec![0.0, 1.0, 2.0], vec![5.0, 6.0, 7.0]));
+    }
+
+    #[test]
+    fn loads_nordic_power_profiler_export() {
+        let p = tmp("ppk.csv");
+        fs::write(&p, "Timestamp(ms),Current(uA),D0-D7\n0,5.123,00000000\n0.01,5.2,00000000\n0.02,9000.5,00000001\n0.03,8999.1,00000001\n").unwrap();
+        let l = load(&p).unwrap();
+        assert_eq!(l.i, vec![5.123, 5.2, 9000.5, 8999.1]);
+        assert_eq!(l.x, vec![0.0, 1.0, 2.0, 3.0]);
+        assert!((l.period_ms.unwrap() - 0.01).abs() < 1e-12);
     }
 
     #[test]

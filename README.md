@@ -1,6 +1,6 @@
 # Analizator — current & power analyzer GUI
 
-Desktop app for capturing and analysing current measurements from the Analizator board over a serial port. Written in Rust ([egui](https://github.com/emilk/egui) + [egui_plot](https://github.com/emilk/egui_plot)); compiles to a single executable for Linux or Windows with nothing else to install.
+Desktop app for capturing and analysing current measurements from the Analizator board, or from a **Nordic Power Profiler Kit II (PPK2)**. Written in Rust ([egui](https://github.com/emilk/egui) + [egui_plot](https://github.com/emilk/egui_plot)); compiles to a single executable for Linux or Windows with nothing else to install.
 
 ![screenshot](docs/screenshot.png)
 
@@ -27,6 +27,8 @@ If connecting fails with "Permission denied", run `sudo usermod -aG dialout $USE
 
 ## Features
 
+- **Nordic PPK2 support**: pick "PPK2" in the port list. Ampere-meter or source-meter mode, supply voltage (0.8–5 V), device power on/off, 100 / 10 / 1 kHz sample rate, lost-sample detection; Power Profiler CSV exports open directly
+
 - Live capture with current and power plots plus an overview strip for navigating long recordings
 - Min/max ("peak") decimation, so short current spikes stay visible at any zoom level; stays smooth with tens of millions of samples
 - Statistics for the whole capture, a selection, or the visible window: duration, avg/RMS/peak/min current, avg/peak power, charge, energy
@@ -39,6 +41,21 @@ If connecting fails with "Permission denied", run `sudo usermod -aG dialout $USE
 - **Auto-reconnect**: if the board is unplugged, the recording so far is saved and the app reconnects by itself when it comes back
 - Counter of corrupted serial frames (missing start/end marker or bad values) in the status bar
 - Settings are remembered between runs
+
+## Nordic PPK2
+
+The PPK2 shows up in the port list as **PPK2 (serial number)**. Connect, then use the **PPK2** panel:
+
+| Setting | |
+|---|---|
+| Mode | **Ampere meter**: the device runs from its own supply and the PPK2 measures the current in series. **Source meter**: the PPK2 powers the device. The mode and voltage stored in the PPK2 are used when connecting, like in Nordic's app. |
+| Supply | Source-meter voltage, 0.8–5.0 V. Sent when you press Enter or finish dragging, never while typing. |
+| Device power | Switches the device under test on/off. In source-meter mode it starts **off**; Record switches it on. |
+| Sample rate | 100 kHz (raw), or 10 kHz / 1 kHz (averages of 10 / 100 raw samples). 100 kHz fills memory in about 5 minutes. |
+
+The status bar counts PPK2 samples and **lost** samples (from the PPK2's sample counter); lost samples are filled with the previous value so the time axis stays correct. The protocol (commands, calibration data, 4-byte sample format, range-switch spike filter) follows Nordic's [nRF Connect Power Profiler](https://github.com/NordicSemiconductor/pc-nrfconnect-ppk) and [ppk2-api-python](https://github.com/IRNAS/ppk2-api-python). The PPK2 has two serial ports; the app uses the first and falls back to the second if it does not answer.
+
+**Opening Power Profiler files:** CSV files exported from Nordic's app (`Timestamp(ms),Current(uA),D0-D7`) open with **Open CSV…**; the sample period is taken from the timestamps.
 
 ## Serial protocol
 
@@ -138,7 +155,8 @@ sudo usermod -aG dialout $USER   # then log out and back in
 | `src/main.rs` | Window setup |
 | `src/app.rs` | User interface, plotting, capture logic |
 | `src/data.rs` | Sample storage with per-256-sample min/max/sum blocks (fast drawing and statistics) |
-| `src/serial.rs` | Port listing, reader thread, frame parser, DEMO board |
+| `src/serial.rs` | Port listing, reader threads, frame parser, DEMO board |
+| `src/ppk2.rs` | PPK2 protocol: commands, calibration data, sample decoding, lost-sample detection |
 | `src/filter.rs` | Moving average, median and low-pass filters |
 | `src/csvio.rs` | CSV load/save |
 | `src/fmt.rs` | SI-prefix number formatting |
@@ -162,3 +180,5 @@ Besides the built-in DEMO device, any serial device path can be added to the por
 socat pty,raw,echo=0,link=/tmp/ttyV0 pty,raw,echo=0,link=/tmp/ttyV1 &
 ANALIZATOR_EXTRA_PORTS=/tmp/ttyV0 ./analizator    # a script on /tmp/ttyV1 plays the board
 ```
+
+`ANALIZATOR_PPK2_PORTS` works the same way but treats the ports as a PPK2 (for testing with a simulated PPK2).

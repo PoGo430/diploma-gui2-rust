@@ -10,6 +10,12 @@ QUICK START
 
   No hardware? Pick "DEMO — simulated device" in the port list.
 
+NORDIC PPK2
+  A Power Profiler Kit II shows up in the port list as "PPK2 (...)". After
+  connecting, the PPK2 panel sets ampere-/source-meter mode, the supply
+  voltage, device power and the sample rate (100 / 10 / 1 kHz). Power
+  Profiler CSV exports open with "Open CSV...".
+
 CONNECTING THE BOARD
   The board shows up as a COM port (e.g. "COM3 — ..."). Windows 10/11 has the
   driver for USB CDC devices built in. Boards with a CH340 or CP210x USB chip

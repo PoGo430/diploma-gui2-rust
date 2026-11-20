@@ -6,6 +6,7 @@ mod csvio;
 mod data;
 mod filter;
 mod fmt;
+mod ppk2;
 mod serial;
 
 fn main() -> eframe::Result {

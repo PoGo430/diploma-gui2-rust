@@ -17,7 +17,8 @@ use crate::csvio;
 use crate::data::{DataStore, MAX_SAMPLES};
 use crate::filter::{FilterCfg, FilterKind, MAX_AVG_WINDOW, MAX_MEDIAN_WINDOW};
 use crate::fmt;
-use crate::serial::{self, Connection, DEMO_PORT, Msg, PortInfo};
+use crate::ppk2;
+use crate::serial::{self, Connection, DEMO_PORT, LinkKind, Msg, PortInfo};
 
 // ------------------------------------------------------------- colours ---
 const BG: Color32 = Color32::from_rgb(0x0d, 0x11, 0x17);
@@ -63,6 +64,8 @@ pub struct Settings {
     battery_mah: f64,
     threshold_ma: f64,
     show_threshold: bool,
+    /// PPK2: how many 10 µs samples are averaged into one (1 = 100 kHz, 10 = 10 kHz, 100 = 1 kHz)
+    ppk2_decimation: u32,
 }
 
 impl Default for Settings {
@@ -83,6 +86,7 @@ impl Default for Settings {
             battery_mah: 220.0,
             threshold_ma: 1.0,
             show_threshold: true,
+            ppk2_decimation: 10,
         }
     }
 }
@@ -102,6 +106,15 @@ struct Reconnect {
     desc: String,
     baud: u32,
     last_try: Instant,
+    ppk2: bool,
+}
+
+/// PPK2 state as last sent to the device.
+#[derive(Clone, Copy)]
+struct Ppk2State {
+    source_meter: bool,
+    dut_power: bool,
+    vdd_mv: u32,
 }
 
 #[derive(Clone)]
@@ -136,6 +149,7 @@ enum Grab {
 enum Confirm {
     Erase,
     DumpReplace,
+    Ppk2Rate(u32),
 }
 
 #[derive(Clone, Copy)]
@@ -209,6 +223,9 @@ pub struct AnalyzerApp {
     /// Where the plot's right-click menu was opened (sample index) and the marker under it.
     ctx_menu: Option<(f64, Option<usize>)>,
     state_cache: Option<((u64, usize, usize, u64, bool), Instant, StateSplit)>,
+    ppk2: Option<Ppk2State>,
+    /// Supply voltage being edited in the PPK2 panel (V); sent when the drag ends.
+    ppk2_vdd_edit: f64,
 }
 
 impl AnalyzerApp {
@@ -277,6 +294,8 @@ impl AnalyzerApp {
             focus_tries: 0,
             ctx_menu: None,
             state_cache: None,
+            ppk2: None,
+            ppk2_vdd_edit: 3.3,
         };
         app.s.filter = app.s.filter.sanitized();
         app.filter_edit = app.s.filter;
@@ -323,6 +342,7 @@ impl AnalyzerApp {
     fn toggle_connection(&mut self, ctx: &egui::Context) {
         if self.mode == Mode::Reconnecting {
             self.reconnect = None;
+            self.ppk2 = None;
             self.mode = Mode::Offline;
             self.log("Stopped waiting for the device.", MUTED);
             self.status = "Disconnected".into();
@@ -340,6 +360,10 @@ impl AnalyzerApp {
             }
         };
         self.s.baud = baud;
+        if let Some(p) = self.ports.iter().find(|p| p.path == self.port_sel && p.ppk2).cloned() {
+            self.connect_ppk2(&p, ctx);
+            return;
+        }
         match Connection::open(&self.port_sel, baud, self.dt(), ctx.clone()) {
             Ok(c) => {
                 let name = c.name.clone();
@@ -362,6 +386,7 @@ impl AnalyzerApp {
         if let Some(c) = self.conn.take() {
             c.close();
         }
+        self.ppk2 = None;
         self.mode = Mode::Offline;
         match reason {
             Some(r) => {
@@ -373,6 +398,181 @@ impl AnalyzerApp {
                 self.status = "Disconnected".into();
             }
         }
+    }
+
+    fn is_ppk2(&self) -> bool {
+        self.conn.as_ref().is_some_and(|c| c.kind == LinkKind::Ppk2)
+    }
+
+    fn connect_ppk2(&mut self, port: &PortInfo, ctx: &egui::Context) {
+        let mut paths = vec![port.path.clone()];
+        paths.extend(port.alt_paths.iter().cloned());
+        self.status = "Connecting to PPK2…".into();
+        match Connection::open_ppk2(&paths, self.s.ppk2_decimation, ctx.clone()) {
+            Ok(c) => {
+                let meta = c.ppk2_meta.clone().unwrap_or_default();
+                let name = c.name.clone();
+                self.conn = Some(c);
+                self.mode = Mode::Connected;
+                self.s.last_port = port.path.clone();
+                self.s.period_ms = 0.01 * self.s.ppk2_decimation as f64;
+                // like Nordic's app: keep the mode and voltage stored in the PPK2
+                let source_meter = meta.mode == Some(2);
+                let vdd = meta.vdd.unwrap_or(3300).clamp(ppk2::VDD_MIN_MV, ppk2::VDD_MAX_MV);
+                // ampere meter: the PPK2 must pass the current through, so power on;
+                // source meter: start with the output off until the user switches it on
+                let st = Ppk2State { source_meter, dut_power: !source_meter, vdd_mv: vdd };
+                self.ppk2 = Some(st);
+                self.ppk2_apply(st);
+                if source_meter {
+                    self.s.voltage = vdd as f64 / 1000.0;
+                }
+                self.ppk2_vdd_edit = vdd as f64 / 1000.0;
+                let cal = match meta.calibrated.as_deref() {
+                    Some("1") | Some("true") => "calibrated",
+                    _ => "factory values",
+                };
+                self.log(
+                    format!(
+                        "PPK2 connected on {name} (HW {}, {cal}) · {} · {}",
+                        meta.hw.as_deref().unwrap_or("?"),
+                        if source_meter { "source meter" } else { "ampere meter" },
+                        fmt::si(vdd as f64 / 1000.0, "V"),
+                    ),
+                    GREEN,
+                );
+                if source_meter {
+                    self.log("Device power is OFF — switch it on in the PPK2 panel (or just press Record).", AMBER);
+                }
+                self.status = format!("Connected to PPK2 on {name}");
+            }
+            Err(e) => self.show_error("PPK2", format!("Could not connect to the PPK2.\n\n{e}")),
+        }
+    }
+
+    /// Send the whole PPK2 state (mode, voltage, power) to the device.
+    fn ppk2_apply(&mut self, st: Ppk2State) {
+        let Some(c) = self.conn.as_mut() else { return };
+        let r = c
+            .send_raw(&ppk2::power_mode_cmd(st.source_meter))
+            .and_then(|_| c.ppk2_set_vdd(st.vdd_mv))
+            .and_then(|_| c.send_raw(&ppk2::dut_power_cmd(st.dut_power)));
+        if let Err(e) = r {
+            self.log(format!("PPK2 command failed: {e}"), RED);
+        }
+        self.ppk2 = Some(st);
+    }
+
+    fn ppk2_set_power(&mut self, on: bool) {
+        if let Some(mut st) = self.ppk2 {
+            st.dut_power = on;
+            if let Some(c) = self.conn.as_mut() {
+                if let Err(e) = c.send_raw(&ppk2::dut_power_cmd(on)) {
+                    self.log(format!("PPK2 command failed: {e}"), RED);
+                    return;
+                }
+            }
+            self.ppk2 = Some(st);
+            self.log(format!("Device power {}", if on { "ON" } else { "OFF" }), if on { GREEN } else { MUTED });
+        }
+    }
+
+    fn ppk2_set_rate(&mut self, decimation: u32) {
+        self.store.clear();
+        self.markers.clear();
+        self.s.ppk2_decimation = decimation;
+        self.s.period_ms = 0.01 * decimation as f64;
+        if let Some(c) = &self.conn {
+            c.ppk2_set_decimation(decimation);
+        }
+        self.view = (0.0, self.s.live_window_s / self.dt());
+        self.log(format!("PPK2 sample rate: {}", fmt::si(ppk2::SAMPLE_RATE / decimation as f64, "Hz")), MUTED);
+    }
+
+    fn ppk2_ui(&mut self, ui: &mut Ui) {
+        let Some(st) = self.ppk2 else { return };
+        let rec = self.recording();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Mode").color(MUTED));
+            ui.add_enabled_ui(!rec, |ui| {
+                let mut source = st.source_meter;
+                ui.selectable_value(&mut source, false, "Ampere meter")
+                    .on_hover_text("The device runs from its own supply; the PPK2 measures the current in series.");
+                ui.selectable_value(&mut source, true, "Source meter")
+                    .on_hover_text("The PPK2 powers the device (0.8–5 V) and measures its current.");
+                if source != st.source_meter {
+                    // ampere meter needs the pass-through switched on; the source output starts off
+                    let new = Ppk2State { source_meter: source, dut_power: !source, ..st };
+                    self.ppk2_apply(new);
+                    self.log(
+                        format!("PPK2 mode: {}", if source { "source meter (output off)" } else { "ampere meter" }),
+                        MUTED,
+                    );
+                }
+            });
+        });
+        let st = self.ppk2.unwrap_or(st);
+        if st.source_meter {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Supply").color(MUTED));
+                let r = ui.add(
+                    egui::DragValue::new(&mut self.ppk2_vdd_edit)
+                        .range(0.8..=5.0)
+                        .speed(0.01)
+                        .fixed_decimals(3)
+                        .suffix(" V")
+                        // never send half-typed values ("1" while typing "1.8") to the device
+                        .update_while_editing(false),
+                );
+                let mv = (self.ppk2_vdd_edit * 1000.0).round() as u32;
+                if (r.drag_stopped() || (r.changed() && !r.dragged())) && mv != st.vdd_mv {
+                    if let Some(c) = self.conn.as_mut() {
+                        let _ = c.ppk2_set_vdd(mv);
+                    }
+                    self.ppk2 = Some(Ppk2State { vdd_mv: mv, ..st });
+                    self.s.voltage = mv as f64 / 1000.0;
+                    self.log(format!("PPK2 supply set to {}", fmt::si(mv as f64 / 1000.0, "V")), MUTED);
+                }
+                r.on_hover_text("Voltage the PPK2 supplies to the device (0.8–5.0 V). Also used for power and energy.");
+            });
+        } else {
+            ui.label(
+                RichText::new("Set DUT voltage (Measurement section) to your device's supply voltage for correct power and energy.")
+                    .size(11.5)
+                    .color(MUTED),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Device power").color(MUTED));
+            let (txt, fill) = if st.dut_power { ("ON", BTN_GREEN) } else { ("OFF", BTN_RED) };
+            if button(ui, true, txt, Some(fill), "Switch the power to the device under test on or off", 56.0) {
+                self.ppk2_set_power(!st.dut_power);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Sample rate").color(MUTED));
+            ui.add_enabled_ui(!rec, |ui| {
+                for (dec, name) in [(1u32, "100 kHz"), (10, "10 kHz"), (100, "1 kHz")] {
+                    if ui.selectable_label(self.s.ppk2_decimation == dec, name).clicked() && self.s.ppk2_decimation != dec {
+                        if self.store.is_empty() {
+                            self.ppk2_set_rate(dec);
+                        } else {
+                            self.confirm = Some(Confirm::Ppk2Rate(dec));
+                        }
+                    }
+                }
+            });
+        });
+        let rate = ppk2::SAMPLE_RATE / self.s.ppk2_decimation as f64;
+        ui.label(
+            RichText::new(format!(
+                "Memory is full after {} at this rate.{}",
+                fmt::duration(MAX_SAMPLES as f64 / rate),
+                if self.s.ppk2_decimation > 1 { " Lower rates average the PPK2's 100 kHz samples." } else { "" }
+            ))
+            .size(11.5)
+            .color(MUTED),
+        );
     }
 
     /// The port failed (usually: USB unplugged). Save what we have and wait for the device to return.
@@ -393,7 +593,8 @@ impl AnalyzerApp {
             self.log("The recording up to this point was saved.", AMBER);
         }
         self.status = format!("Connection lost — waiting for {path} to come back (press Cancel to stop)");
-        self.reconnect = Some(Reconnect { path, desc, baud: self.s.baud, last_try: Instant::now() });
+        let ppk2 = self.ppk2.is_some();
+        self.reconnect = Some(Reconnect { path, desc, baud: self.s.baud, last_try: Instant::now(), ppk2 });
         self.mode = Mode::Reconnecting;
     }
 
@@ -403,6 +604,27 @@ impl AnalyzerApp {
             return;
         }
         r.last_try = Instant::now();
+        if r.ppk2 {
+            // a PPK2 may come back under another port name; take the first PPK2 we find
+            if let Some(p) = serial::list_ports().into_iter().find(|p| p.ppk2) {
+                let prev = self.ppk2;
+                let mut paths = vec![p.path.clone()];
+                paths.extend(p.alt_paths.iter().cloned());
+                if let Ok(c) = Connection::open_ppk2(&paths, self.s.ppk2_decimation, ctx.clone()) {
+                    let name = c.name.clone();
+                    self.conn = Some(c);
+                    self.reconnect = None;
+                    self.mode = Mode::Connected;
+                    self.port_sel = p.path.clone();
+                    if let Some(st) = prev {
+                        self.ppk2_apply(st);
+                    }
+                    self.log(format!("Reconnected to the PPK2 on {name}. Press Record to continue."), GREEN);
+                    self.status = format!("Reconnected to PPK2 on {name}");
+                }
+            }
+            return;
+        }
         // same device path, or (if it came back under another name) the same USB device
         let present = if cfg!(target_os = "linux") {
             Path::new(&r.path).exists()
@@ -431,7 +653,11 @@ impl AnalyzerApp {
     fn log_frame_counts(&mut self) {
         if let Some((f, c)) = self.conn.as_ref().map(|c| c.frame_counts()) {
             let col = if c > 0 { AMBER } else { MUTED };
-            self.log(format!("{} frames received, {} corrupted", fmt::count(f as usize), fmt::count(c as usize)), col);
+            if self.is_ppk2() {
+                self.log(format!("{} PPK2 samples received, {} lost", fmt::count(f as usize), fmt::count(c as usize)), col);
+            } else {
+                self.log(format!("{} frames received, {} corrupted", fmt::count(f as usize), fmt::count(c as usize)), col);
+            }
         }
     }
 
@@ -459,6 +685,9 @@ impl AnalyzerApp {
     }
 
     fn start_capture(&mut self) {
+        if self.ppk2.is_some_and(|st| !st.dut_power) {
+            self.ppk2_set_power(true);
+        }
         if !self.send("START") {
             return;
         }
@@ -848,6 +1077,7 @@ impl AnalyzerApp {
             ui.add_enabled_ui(!linked, |ui| {
                 egui::ComboBox::from_id_salt("port")
                     .width(250.0)
+                    .truncate()
                     .selected_text(label)
                     .show_ui(ui, |ui| {
                         if self.ports.is_empty() {
@@ -864,6 +1094,8 @@ impl AnalyzerApp {
                 if ui.add(egui::Button::new("⟳").min_size(vec2(30.0, 30.0))).on_hover_text("Rescan serial ports").clicked() {
                     self.ports = serial::list_ports();
                 }
+                let ppk2_selected = self.ports.iter().any(|p| p.path == self.port_sel && p.ppk2);
+                ui.add_enabled_ui(!ppk2_selected, |ui| {
                 egui::ComboBox::from_id_salt("baud")
                     .width(96.0)
                     .selected_text(&self.baud_text)
@@ -879,6 +1111,9 @@ impl AnalyzerApp {
                     })
                     .response
                     .on_hover_text("Baud rate");
+                })
+                .response
+                .on_disabled_hover_text("The PPK2 does not use a baud rate");
             });
             let (t, c) = if self.mode == Mode::Reconnecting {
                 ("Cancel", BTN_RED)
@@ -897,10 +1132,11 @@ impl AnalyzerApp {
             if button(ui, connected && rec, "⏹  Stop", Some(BTN_RED), "Stop and save CSV (Ctrl+R)", 0.0) {
                 self.stop();
             }
-            if button(ui, connected && !rec && !busy, "Dump flash", Some(BTN_AMBER), "Download the samples stored in the board's flash", 0.0) {
+            let board = connected && !self.is_ppk2();
+            if button(ui, board && !rec && !busy, "Dump flash", Some(BTN_AMBER), "Download the samples stored in the board's flash", 0.0) {
                 self.request_dump();
             }
-            if button(ui, connected && !rec, "Erase flash", None, "Erase the board's flash memory", 0.0) {
+            if button(ui, board && !rec, "Erase flash", None, "Erase the board's flash memory", 0.0) {
                 self.confirm = Some(Confirm::Erase);
             }
             vsep(ui);
@@ -925,6 +1161,7 @@ impl AnalyzerApp {
                     match self.mode {
                         Mode::Capture => ("⏺  REC".to_string(), RED),
                         Mode::Dump => ("DUMPING".to_string(), AMBER),
+                        Mode::Connected if self.is_ppk2() => ("CONNECTED · PPK2".to_string(), GREEN),
                         Mode::Connected => (format!("CONNECTED · {}", self.conn.as_ref().map(|c| c.name.as_str()).unwrap_or("")), GREEN),
                         Mode::Offline => ("OFFLINE".to_string(), MUTED),
                         Mode::Reconnecting => ("RECONNECTING…".to_string(), AMBER),
@@ -957,9 +1194,15 @@ impl AnalyzerApp {
                 ui.add_space(12.0);
                 if let Some((f, c)) = self.conn.as_ref().map(|c| c.frame_counts()) {
                     let col = if c > 0 { RED } else { MUTED };
-                    ui.label(RichText::new(format!("{} corrupted", fmt::count(c as usize))).color(col))
-                        .on_hover_text("Data frames that arrived damaged (missing start/end marker or a bad value) since the recording started");
-                    ui.label(RichText::new(format!("{} frames ·", fmt::count(f as usize))).color(MUTED));
+                    if self.is_ppk2() {
+                        ui.label(RichText::new(format!("{} lost", fmt::count(c as usize))).color(col))
+                            .on_hover_text("PPK2 samples lost on the way (detected from the sample counter) since the recording started. Gaps are filled with the previous value.");
+                        ui.label(RichText::new(format!("{} PPK2 samples ·", fmt::count(f as usize))).color(MUTED));
+                    } else {
+                        ui.label(RichText::new(format!("{} corrupted", fmt::count(c as usize))).color(col))
+                            .on_hover_text("Data frames that arrived damaged (missing start/end marker or a bad value) since the recording started");
+                        ui.label(RichText::new(format!("{} frames ·", fmt::count(f as usize))).color(MUTED));
+                    }
                     ui.add_space(12.0);
                 }
                 if self.recording() {
@@ -974,15 +1217,23 @@ impl AnalyzerApp {
     fn sidebar(&mut self, ui: &mut Ui) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(8.0);
+            if self.ppk2.is_some() && self.conn.is_some() {
+                section(ui, "PPK2", |ui| self.ppk2_ui(ui));
+                ui.add_space(8.0);
+            }
+            let ppk2_source = self.ppk2.is_some_and(|st| st.source_meter) && self.conn.is_some();
+            let ppk2_rate = self.ppk2.is_some() && self.conn.is_some();
             section(ui, "MEASUREMENT", |ui| {
                 egui::Grid::new("settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                     ui.label(RichText::new("DUT voltage").color(MUTED));
-                    ui.add(egui::DragValue::new(&mut self.s.voltage).range(0.0..=30.0).speed(0.01).fixed_decimals(3).suffix(" V"));
+                    ui.add_enabled(!ppk2_source, egui::DragValue::new(&mut self.s.voltage).range(0.0..=30.0).speed(0.01).fixed_decimals(3).suffix(" V"))
+                        .on_disabled_hover_text("Set by the PPK2's supply voltage (PPK2 section)");
                     ui.end_row();
                     ui.label(RichText::new("Sample period").color(MUTED));
-                    let r = ui.add(
+                    let r = ui.add_enabled(
+                        !ppk2_rate,
                         egui::DragValue::new(&mut self.s.period_ms).range(0.001..=10_000.0).speed(0.01).fixed_decimals(3).suffix(" ms"),
-                    );
+                    ).on_disabled_hover_text("Set by the PPK2 sample rate (PPK2 section)");
                     if r.changed() {
                         if let Some(c) = &self.conn {
                             c.set_demo_period(self.dt());
@@ -1763,6 +2014,7 @@ impl AnalyzerApp {
             let (title, text, ok) = match which {
                 Confirm::Erase => ("Erase flash", "Erase all samples stored in the board's flash memory?\nThis cannot be undone.", "Erase"),
                 Confirm::DumpReplace => ("Dump flash", "Dumping replaces the data currently shown.\nContinue?", "Dump"),
+                Confirm::Ppk2Rate(_) => ("Sample rate", "Changing the sample rate clears the data currently shown.\nContinue?", "Change"),
             };
             let mut answer = None;
             let m = egui::Modal::new(Id::new("confirm")).show(ctx, |ui| {
@@ -1793,6 +2045,7 @@ impl AnalyzerApp {
                             }
                         }
                         Confirm::DumpReplace => self.start_dump(),
+                        Confirm::Ppk2Rate(dec) => self.ppk2_set_rate(dec),
                     }
                 }
             }

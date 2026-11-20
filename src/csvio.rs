@@ -35,10 +35,10 @@ pub struct Meta {
 
 /// `filtered`: optional extra column with the filtered current (export only).
 pub fn save(path: &Path, x: &[f64], i: &[f64], filtered: Option<&[f64]>, meta: &Meta) -> Result<usize, String> {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
-        }
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
     }
     let f = fs::File::create(path).map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
     let mut w = BufWriter::with_capacity(1 << 20, f);
@@ -139,7 +139,7 @@ fn push_trimmed(out: &mut Vec<u8>, v: f64, dec: u32) {
         return;
     }
     let mut digits = dec;
-    while frac % 10 == 0 {
+    while frac.is_multiple_of(10) {
         frac /= 10;
         digits -= 1;
     }
@@ -202,7 +202,8 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
         }
         let cols: Vec<&str> = line.split([',', ';', '\t']).map(str::trim).collect();
         if !layout_known {
-            let is_header = cols.iter().any(|c| c.chars().any(|ch| ch.is_ascii_alphabetic()) && c.parse::<f64>().is_err());
+            let is_header =
+                cols.iter().any(|c| c.chars().any(|ch| ch.is_ascii_alphabetic()) && c.parse::<f64>().is_err());
             if is_header {
                 for (k, name) in cols.iter().enumerate() {
                     let n = name.to_ascii_lowercase();
@@ -383,7 +384,11 @@ mod bench {
         let t = std::time::Instant::now();
         let out = std::env::temp_dir().join("big_out.csv");
         super::save(&out, &l.x, &l.i, None, &super::Meta { voltage: 3.3, period_ms: 1.0, markers: vec![] }).unwrap();
-        eprintln!("saved in {:.2} s, {} MB", t.elapsed().as_secs_f64(), std::fs::metadata(&out).unwrap().len() / 1_000_000);
+        eprintln!(
+            "saved in {:.2} s, {} MB",
+            t.elapsed().as_secs_f64(),
+            std::fs::metadata(&out).unwrap().len() / 1_000_000
+        );
         let t = std::time::Instant::now();
         let l2 = super::load(&out).unwrap();
         eprintln!("re-loaded new format in {:.2} s", t.elapsed().as_secs_f64());

@@ -11,8 +11,9 @@
 use crate::filter::{self, FilterCfg};
 
 pub const BLOCK: usize = 256;
-/// ~16 bytes per sample (+8 with a filter) -> about 480 MB when full (8.3 h at 1 kHz).
-pub const MAX_SAMPLES: usize = 30_000_000;
+/// ~8 bytes per sample (+8 with a filter) -> about 400 MB when full
+/// (13.9 h at 1 kHz, 8.3 min at the PPK2's 100 kHz).
+pub const MAX_SAMPLES: usize = 50_000_000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Agg {
@@ -26,15 +27,8 @@ pub struct Agg {
 }
 
 impl Agg {
-    pub const EMPTY: Agg = Agg {
-        count: 0,
-        sum: 0.0,
-        sumsq: 0.0,
-        min: f64::INFINITY,
-        max: f64::NEG_INFINITY,
-        min_at: 0,
-        max_at: 0,
-    };
+    pub const EMPTY: Agg =
+        Agg { count: 0, sum: 0.0, sumsq: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY, min_at: 0, max_at: 0 };
 
     #[inline]
     fn add(&mut self, idx: usize, v: f64) {
@@ -102,7 +96,7 @@ impl Series {
     #[inline]
     fn push(&mut self, val: f64) {
         let idx = self.v.len();
-        if idx % BLOCK == 0 {
+        if idx.is_multiple_of(BLOCK) {
             self.blocks.push(Agg::EMPTY);
         }
         self.v.push(val);
@@ -125,7 +119,7 @@ impl Series {
         self.v.truncate(len);
         let nb = len.div_ceil(BLOCK);
         self.blocks.truncate(nb);
-        if len % BLOCK != 0 {
+        if !len.is_multiple_of(BLOCK) {
             let s = (nb - 1) * BLOCK;
             let mut b = Agg::EMPTY;
             for k in s..len {
@@ -194,9 +188,15 @@ impl Series {
     }
 }
 
+/// Sample positions (x). Recordings are evenly spaced (start, start+1, …) and
+/// need no storage; only imported files with gaps keep an explicit list.
+enum Positions {
+    Even { start: f64 },
+    Listed(Vec<f64>),
+}
+
 pub struct DataStore {
-    /// Sample index (normally 0,1,2,... but CSV files may have gaps).
-    pub x: Vec<f64>,
+    pos: Positions,
     /// Current in µA, exactly as received.
     pub raw: Series,
     /// Filtered current in µA (same length as `raw` while a filter is active, else empty).
@@ -211,7 +211,7 @@ pub struct DataStore {
 impl Default for DataStore {
     fn default() -> Self {
         Self {
-            x: Vec::with_capacity(1 << 20),
+            pos: Positions::Even { start: 0.0 },
             raw: Series::with_capacity(1 << 20),
             filt: Series::default(),
             filter: FilterCfg::default(),
@@ -232,7 +232,7 @@ impl DataStore {
     }
 
     pub fn clear(&mut self) {
-        self.x.clear();
+        self.pos = Positions::Even { start: 0.0 };
         self.raw.clear();
         self.filt.clear();
         self.next_index = 0.0;
@@ -240,7 +240,11 @@ impl DataStore {
     }
 
     pub fn bytes(&self) -> usize {
-        self.x.capacity() * 8 + self.raw.bytes() + self.filt.bytes()
+        let pos = match &self.pos {
+            Positions::Even { .. } => 0,
+            Positions::Listed(v) => v.capacity() * 8,
+        };
+        pos + self.raw.bytes() + self.filt.bytes()
     }
 
     pub fn filter_active(&self) -> bool {
@@ -293,9 +297,11 @@ impl DataStore {
     pub fn append(&mut self, chunk: &[f64]) -> usize {
         let old_n = self.len();
         let k = chunk.len().min(MAX_SAMPLES - old_n);
-        self.x.reserve(k);
+        self.raw.v.reserve(k);
         for &v in &chunk[..k] {
-            self.x.push(self.next_index);
+            if let Positions::Listed(x) = &mut self.pos {
+                x.push(self.next_index);
+            }
             self.raw.push(v);
             self.next_index += 1.0;
         }
@@ -304,60 +310,95 @@ impl DataStore {
         k
     }
 
+    /// Replace the data. `x` must be sorted; evenly spaced positions are not stored.
     pub fn load(&mut self, x: Vec<f64>, i: Vec<f64>) {
-        let n = i.len().min(MAX_SAMPLES);
+        let n = i.len().min(MAX_SAMPLES).min(x.len());
+        let even = x[..n].iter().enumerate().all(|(k, &v)| v == x[0] + k as f64);
+        self.pos = if n == 0 || even {
+            Positions::Even { start: x.first().copied().unwrap_or(0.0) }
+        } else {
+            let mut x = x;
+            x.truncate(n);
+            x.shrink_to_fit();
+            Positions::Listed(x)
+        };
         // fresh buffers so memory from a bigger previous capture is released
-        self.x = x;
-        self.x.truncate(n);
-        self.x.shrink_to_fit();
         self.raw = Series::with_capacity(n.max(1024));
         self.raw.extend(&i[..n]);
-        self.next_index = if n > 0 { self.x[n - 1] + 1.0 } else { 0.0 };
+        self.next_index = if n > 0 { self.x_at(n - 1) + 1.0 } else { 0.0 };
         self.recompute_filter();
     }
 
+    /// Sample index (x position) of sample `k`.
+    #[inline]
+    pub fn x_at(&self, k: usize) -> f64 {
+        match &self.pos {
+            Positions::Even { start } => start + k as f64,
+            Positions::Listed(x) => x[k],
+        }
+    }
+
+    /// Sample indices of samples [a, b).
+    pub fn x_range(&self, a: usize, b: usize) -> Vec<f64> {
+        match &self.pos {
+            Positions::Even { start } => (a..b).map(|k| start + k as f64).collect(),
+            Positions::Listed(x) => x[a..b].to_vec(),
+        }
+    }
+
     pub fn first_x(&self) -> f64 {
-        self.x.first().copied().unwrap_or(0.0)
+        if self.is_empty() { 0.0 } else { self.x_at(0) }
     }
 
     pub fn last_x(&self) -> f64 {
-        self.x.last().copied().unwrap_or(0.0)
+        if self.is_empty() { 0.0 } else { self.x_at(self.len() - 1) }
     }
 
     /// Indices [a, b) of samples whose x lies within [x0, x1].
     pub fn index_range(&self, x0: f64, x1: f64) -> (usize, usize) {
-        let a = self.x.partition_point(|&v| v < x0);
-        let b = self.x.partition_point(|&v| v <= x1);
+        let n = self.len();
+        let (a, b) = match &self.pos {
+            Positions::Even { start } => {
+                let idx = |v: f64| if v.is_nan() { 0 } else { v.clamp(0.0, n as f64) as usize };
+                (idx((x0 - start).ceil()), idx((x1 - start).floor() + 1.0))
+            }
+            Positions::Listed(x) => (x.partition_point(|&v| v < x0), x.partition_point(|&v| v <= x1)),
+        };
         (a, b.max(a))
     }
 
     pub fn nearest(&self, xv: f64) -> Option<usize> {
         let n = self.len();
-        if n == 0 {
+        if n == 0 || xv.is_nan() {
             return None;
         }
-        let k = self.x.partition_point(|&v| v < xv);
-        if k >= n {
-            return Some(n - 1);
+        match &self.pos {
+            Positions::Even { start } => Some((xv - start).round().clamp(0.0, (n - 1) as f64) as usize),
+            Positions::Listed(x) => {
+                let k = x.partition_point(|&v| v < xv);
+                if k >= n {
+                    return Some(n - 1);
+                }
+                if k > 0 && (x[k - 1] - xv).abs() < (x[k] - xv).abs() {
+                    return Some(k - 1);
+                }
+                Some(k)
+            }
         }
-        if k > 0 && (self.x[k - 1] - xv).abs() < (self.x[k] - xv).abs() {
-            return Some(k - 1);
-        }
-        Some(k)
     }
 
     /// Reduce samples [a, b) of series `s` to about `buckets` min/max pairs for drawing.
     /// Returns (x, current µA) points. Short spikes are never lost.
     pub fn decimate(&self, s: &Series, a: usize, b: usize, buckets: usize, out: &mut Vec<(f64, f64)>) {
         out.clear();
-        let b = b.min(s.len()).min(self.x.len());
+        let b = b.min(s.len()).min(self.len());
         if a >= b {
             return;
         }
         let n = b - a;
         let buckets = buckets.max(1);
         if n <= buckets * 3 {
-            out.extend((a..b).map(|k| (self.x[k], s.v[k])));
+            out.extend((a..b).map(|k| (self.x_at(k), s.v[k])));
             return;
         }
         out.reserve(buckets * 2);
@@ -369,9 +410,9 @@ impl DataStore {
             }
             let g = s.agg(st, en);
             let (p, q) = if g.min_at <= g.max_at { (g.min_at, g.max_at) } else { (g.max_at, g.min_at) };
-            out.push((self.x[p], s.v[p]));
+            out.push((self.x_at(p), s.v[p]));
             if q != p {
-                out.push((self.x[q], s.v[q]));
+                out.push((self.x_at(q), s.v[q]));
             }
         }
     }
@@ -411,6 +452,39 @@ mod tests {
         d.decimate(&d.raw, 0, d.len(), 1000, &mut out);
         assert!(out.len() <= 2000);
         assert!(out.iter().any(|p| p.1 == 5000.0));
+    }
+
+    /// Evenly spaced data (no stored positions) must answer every lookup exactly
+    /// like an explicit position list.
+    #[test]
+    fn even_positions_match_listed() {
+        let i: Vec<f64> = (0..1000).map(|k| k as f64).collect();
+        let x: Vec<f64> = (0..1000).map(|k| 500.0 + k as f64).collect();
+        let mut even = DataStore::default();
+        even.load(x.clone(), i.clone());
+        assert!(matches!(even.pos, Positions::Even { start } if start == 500.0));
+        let mut listed = DataStore { pos: Positions::Listed(x.clone()), ..Default::default() };
+        listed.raw.extend(&i);
+        for (x0, x1) in
+            [(0.0, 10.0), (499.5, 510.2), (600.0, 600.0), (1400.0, f64::INFINITY), (-1e9, 1e9), (2000.0, 3000.0)]
+        {
+            assert_eq!(even.index_range(x0, x1), listed.index_range(x0, x1), "{x0}..{x1}");
+        }
+        for xv in [-5.0, 499.4, 500.6, 750.49, 1499.0, 9999.0] {
+            assert_eq!(even.nearest(xv), listed.nearest(xv), "{xv}");
+        }
+        assert_eq!(even.x_range(10, 13), vec![510.0, 511.0, 512.0]);
+        assert_eq!((even.first_x(), even.last_x(), even.next_index), (500.0, 1499.0, 1500.0));
+        // a file with a gap keeps its positions
+        let mut gap = DataStore::default();
+        gap.load(vec![0.0, 1.0, 5.0], vec![1.0, 2.0, 3.0]);
+        assert_eq!(gap.index_range(2.0, 5.0), (2, 3));
+        gap.append(&[4.0]);
+        assert_eq!(gap.last_x(), 6.0);
+        // recording needs no position storage
+        let mut rec = DataStore::default();
+        rec.append(&vec![1.0; 10_000]);
+        assert_eq!(rec.bytes(), rec.raw.bytes());
     }
 
     /// Filtering while data streams in must give exactly the same result as

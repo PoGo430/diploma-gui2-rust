@@ -41,7 +41,7 @@ impl FilterCfg {
     pub fn sanitized(mut self) -> Self {
         let max = if self.kind == FilterKind::Median { MAX_MEDIAN_WINDOW } else { MAX_AVG_WINDOW };
         self.window = self.window.clamp(3, max) | 1;
-        if !(self.cutoff_hz > 0.0) {
+        if self.cutoff_hz.is_nan() || self.cutoff_hz <= 0.0 {
             self.cutoff_hz = 1.0;
         }
         self
@@ -62,7 +62,9 @@ impl FilterCfg {
             FilterKind::MovingAverage => {
                 format!("moving average · {} samples ({})", self.window, crate::fmt::si(self.window as f64 * dt, "s"))
             }
-            FilterKind::Median => format!("median · {} samples ({})", self.window, crate::fmt::si(self.window as f64 * dt, "s")),
+            FilterKind::Median => {
+                format!("median · {} samples ({})", self.window, crate::fmt::si(self.window as f64 * dt, "s"))
+            }
             FilterKind::LowPass => format!("low-pass · {}", crate::fmt::si(self.cutoff_hz, "Hz")),
         }
     }
@@ -217,7 +219,13 @@ mod bench {
     fn speed() {
         let n = 10_000_000;
         let x: Vec<f64> = (0..n).map(|k| ((k * 7919) % 997) as f64).collect();
-        for (kind, w) in [(FilterKind::MovingAverage, 1001), (FilterKind::LowPass, 3), (FilterKind::Median, 21), (FilterKind::Median, 201), (FilterKind::Median, 2001)] {
+        for (kind, w) in [
+            (FilterKind::MovingAverage, 1001),
+            (FilterKind::LowPass, 3),
+            (FilterKind::Median, 21),
+            (FilterKind::Median, 201),
+            (FilterKind::Median, 2001),
+        ] {
             let cfg = FilterCfg { kind, window: w, cutoff_hz: 10.0 };
             let t = std::time::Instant::now();
             let y = apply(&cfg, 1e-3, &x, 0, None);

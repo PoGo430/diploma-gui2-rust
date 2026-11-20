@@ -40,6 +40,8 @@ If connecting fails with "Permission denied", run `sudo usermod -aG dialout $USE
 - Built-in **DEMO** device for trying the app without hardware
 - **Auto-reconnect**: if the board is unplugged, the recording so far is saved and the app reconnects by itself when it comes back
 - Counter of corrupted serial frames (missing start/end marker or bad values) in the status bar
+- Drag & drop a CSV file onto the window to open it; **F1** shows all controls
+- Crash reports are written to the logs folder
 - Settings are remembered between runs
 
 ## Nordic PPK2
@@ -148,18 +150,13 @@ Opening a serial port requires membership in the `dialout` group (`uucp` on Arch
 sudo usermod -aG dialout $USER   # then log out and back in
 ```
 
-## Source layout
+## Source code
 
-| File | Purpose |
-|---|---|
-| `src/main.rs` | Window setup |
-| `src/app.rs` | User interface, plotting, capture logic |
-| `src/data.rs` | Sample storage with per-256-sample min/max/sum blocks (fast drawing and statistics) |
-| `src/serial.rs` | Port listing, reader threads, frame parser, DEMO board |
-| `src/ppk2.rs` | PPK2 protocol: commands, calibration data, sample decoding, lost-sample detection |
-| `src/filter.rs` | Moving average, median and low-pass filters |
-| `src/csvio.rs` | CSV load/save |
-| `src/fmt.rs` | SI-prefix number formatting |
+The code is split into the GUI (`src/app/`), shared widgets (`src/ui/`) and a device layer
+(`src/device/`) where every device is a pluggable driver: transport (serial port, …) → protocol
+decoder → device. Adding a device, changing the board's protocol or moving it to native USB only
+touches `src/device/`. **[DEVELOPING.md](DEVELOPING.md)** explains the structure and has
+step-by-step recipes with code skeletons.
 
 ## Releases
 

@@ -42,6 +42,7 @@ USING IT
   M ...................... add a marker (right-click a plot for more)
   Filter panel ........... Average / Median / Low-pass smoothing of the plots
                            (recordings are always saved unfiltered)
+  F1 ..................... all controls; drop a CSV file on the window to open it
   Ctrl+R record/stop · Ctrl+O open · Ctrl+S export · Ctrl+F fit · Ctrl+E selection
 
 REQUIREMENTS

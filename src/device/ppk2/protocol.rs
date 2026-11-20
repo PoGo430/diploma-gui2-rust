@@ -1,4 +1,5 @@
-//! Nordic Power Profiler Kit II (PPK2) support.
+//! Nordic Power Profiler Kit II (PPK2) protocol: commands, calibration data and
+//! decoding of the sample stream. No GUI or port handling here.
 //!
 //! Protocol details follow Nordic's own nRF Connect Power Profiler app
 //! (github.com/NordicSemiconductor/pc-nrfconnect-ppk, src/device/serialDevice.ts)
@@ -136,7 +137,14 @@ const SPIKE_SAMPLES: i32 = 3;
 
 impl Converter {
     pub fn new(meta: Meta) -> Self {
-        Self { meta, rolling_avg: None, rolling_avg4: None, prev_range: None, consecutive_range_samples: 0, after_spike: 0 }
+        Self {
+            meta,
+            rolling_avg: None,
+            rolling_avg4: None,
+            prev_range: None,
+            consecutive_range_samples: 0,
+            after_spike: 0,
+        }
     }
 
     /// Call when sampling (re)starts.
@@ -153,7 +161,8 @@ impl Converter {
         let m = &self.meta;
         let without_gain = (adc_val - m.o[range]) * (ADC_MULT / m.r[range]);
         let mut adc = m.ug[range]
-            * (without_gain * (m.gs[range] * without_gain + m.gi[range]) + (m.s[range] * (vdd_mv / 1000.0) + m.i[range]));
+            * (without_gain * (m.gs[range] * without_gain + m.gi[range])
+                + (m.s[range] * (vdd_mv / 1000.0) + m.i[range]));
 
         let prev_avg = self.rolling_avg;
         let prev_avg4 = self.rolling_avg4;
@@ -252,15 +261,15 @@ impl Stream {
             let ua = self.conv.convert(range, adc, vdd_mv) * 1e6;
             self.received += 1;
             // the 6-bit counter goes up by one per sample; a jump means samples were lost
-            if let Some(exp) = self.expected_counter {
-                if counter != exp {
-                    let missing = (counter.wrapping_sub(exp)) & 0x3f;
-                    self.lost += missing as u64;
-                    // keep the time axis right: repeat the last value for the missing samples
-                    for _ in 0..missing {
-                        let v = self.last_value;
-                        self.push_value(v, decimation, out);
-                    }
+            if let Some(exp) = self.expected_counter
+                && counter != exp
+            {
+                let missing = (counter.wrapping_sub(exp)) & 0x3f;
+                self.lost += missing as u64;
+                // keep the time axis right: repeat the last value for the missing samples
+                for _ in 0..missing {
+                    let v = self.last_value;
+                    self.push_value(v, decimation, out);
                 }
             }
             self.expected_counter = Some((counter + 1) & 0x3f);
@@ -269,6 +278,79 @@ impl Stream {
         }
         self.remainder = data[whole..].to_vec();
     }
+}
+
+// ------------------------------------------------------------- link glue ---
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+use crate::device::link::{ByteReader, ByteWriter, Decoded, Decoder};
+
+/// Settings the GUI changes while the reader thread runs.
+#[derive(Debug)]
+pub struct Live {
+    pub vdd_mv: AtomicU32,
+    pub decimation: AtomicU32,
+}
+
+/// [`Decoder`] for the PPK2 sample stream.
+pub struct Ppk2Decoder {
+    stream: Stream,
+    live: Arc<Live>,
+}
+
+impl Ppk2Decoder {
+    pub fn new(meta: Meta, live: Arc<Live>) -> Self {
+        Self { stream: Stream::new(meta), live }
+    }
+}
+
+impl Decoder for Ppk2Decoder {
+    fn feed(&mut self, bytes: &[u8], out: &mut Decoded) {
+        let (r0, l0) = (self.stream.received, self.stream.lost);
+        let vdd = self.live.vdd_mv.load(Ordering::Relaxed) as f64;
+        let dec = self.live.decimation.load(Ordering::Relaxed);
+        self.stream.feed(bytes, vdd, dec, &mut out.samples);
+        out.received += self.stream.received - r0;
+        out.damaged += self.stream.lost - l0;
+    }
+
+    fn restart(&mut self) {
+        self.stream.reset();
+    }
+}
+
+/// Stop any running measurement and read the calibration data.
+pub fn handshake(reader: &mut dyn ByteReader, writer: &mut dyn ByteWriter, timeout: Duration) -> Result<Meta, String> {
+    let _ = writer.write(&[cmd::AVERAGE_STOP]);
+    // throw away whatever was still streaming
+    let mut buf = vec![0u8; 65536];
+    let t0 = Instant::now();
+    let mut quiet_since = Instant::now();
+    while t0.elapsed() < Duration::from_millis(1500) && quiet_since.elapsed() < Duration::from_millis(120) {
+        if let Ok(n) = reader.read(&mut buf)
+            && n > 0
+        {
+            quiet_since = Instant::now();
+        }
+    }
+    writer.write(&[cmd::GET_META_DATA]).map_err(|e| format!("Could not write: {e}"))?;
+    let mut text = Vec::new();
+    let t0 = Instant::now();
+    while t0.elapsed() < timeout {
+        match reader.read(&mut buf) {
+            Ok(n) => {
+                text.extend_from_slice(&buf[..n]);
+                if text.windows(3).any(|w| w == b"END") {
+                    return Ok(Meta::parse(&String::from_utf8_lossy(&text)));
+                }
+            }
+            Err(e) => return Err(format!("Read error: {e}")),
+        }
+    }
+    Err("no calibration data received".into())
 }
 
 #[cfg(test)]
@@ -348,6 +430,32 @@ mod tests {
         let b: Vec<u8> = (0..10u32).flat_map(|k| word(1000, 1, k)).collect();
         s.feed(&b, 3300.0, 5, &mut out);
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn handshake_reads_metadata() {
+        use crate::device::link::testing::Pipe;
+        let pipe = Pipe::default();
+        let (mut r, mut w) = (pipe.clone(), pipe.clone());
+        // the "device" answers once it was asked
+        let p2 = pipe.clone();
+        let answer = std::thread::spawn(move || {
+            for _ in 0..200 {
+                if p2.written.lock().unwrap().contains(&cmd::GET_META_DATA) {
+                    p2.push(META_TEXT.as_bytes());
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let m = handshake(&mut r, &mut w, Duration::from_secs(2)).unwrap();
+        answer.join().unwrap();
+        assert_eq!(m.vdd, Some(3300));
+        assert_eq!(pipe.take_written(), vec![cmd::AVERAGE_STOP, cmd::GET_META_DATA]);
+        // a silent port times out
+        let silent = Pipe::default();
+        let (mut r, mut w) = (silent.clone(), silent.clone());
+        assert!(handshake(&mut r, &mut w, Duration::from_millis(200)).is_err());
     }
 
     #[test]

@@ -4,12 +4,36 @@
 mod app;
 mod csvio;
 mod data;
+mod device;
 mod filter;
 mod fmt;
-mod ppk2;
-mod serial;
+mod ui;
+
+/// On a crash, write a report next to the captures and tell the user where it is.
+fn install_crash_handler() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        let dir = app::files::logs_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("crash_{}.txt", chrono::Local::now().format("%Y%m%d_%H%M%S")));
+        let report = format!(
+            "Analizator {} crashed\n{}\n\nthread: {}\n{info}\n\n{}",
+            env!("CARGO_PKG_VERSION"),
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            std::thread::current().name().unwrap_or("?"),
+            std::backtrace::Backtrace::force_capture(),
+        );
+        let saved = std::fs::write(&path, report).is_ok();
+        if std::thread::current().name() == Some("main") {
+            let where_ = if saved { format!("\n\nA report was saved to:\n{}", path.display()) } else { String::new() };
+            startup_error(&format!("Analizator stopped because of an internal error.{where_}"));
+        }
+    }));
+}
 
 fn main() -> eframe::Result {
+    install_crash_handler();
     let icon = egui::IconData { rgba: include_bytes!("../assets/icon_64.rgba").to_vec(), width: 64, height: 64 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
